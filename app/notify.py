@@ -32,16 +32,37 @@ async def _send_tg(text: str) -> None:
         # netwerkfouten negeren (non-blocking)
         pass
 
+def _pct(x):
+    try:
+        return f"{x*100:.2f}%"
+    except Exception:
+        return "n/a"
+
 def _human(event: str, data: dict) -> str:
+    t   = data.get("ticker","?")
+    rc  = ", ".join(data.get("reason_codes", [])[:2]) or "-"
+    ent = data.get("entry"); stp = data.get("stop"); sz = data.get("size")
+    ev  = data.get("ev")
+
     if event == "ENTRY_MKT":
-        return f"KOOP {data.get('ticker','?')}: +1% = halve winst; stop naar instap. Reden: {', '.join(data.get('reason_codes',[])[:2])}."
+        ent_s = f"{ent:.2f}" if isinstance(ent,(int,float)) else "?"
+        stp_s = f"{stp:.2f}" if isinstance(stp,(int,float)) else "?"
+        sz_s  = f"{sz}" if sz else "?"
+        ev_s  = _pct(ev)
+        return f"KOOP {t}: @ {ent_s}, SL {stp_s}, size {sz_s}. TP1 = +1% → halve winst. EV {ev_s}. Reden: {rc}."
+
     if event == "TP1_HIT":
-        return f"{data.get('ticker','?')}: +1% geraakt, helft verkocht. Stop naar instap."
+        return f"{t}: +1% geraakt, helft verkocht. Stop naar instap."
+
     if event == "STOP_HIT":
-        return f"UIT {data.get('ticker','?')}: stop geraakt. Verlies beperkt."
+        return f"{t}: stop geraakt. Trade klaar."
+
     if event == "NO_TRADE":
-        return f"GEEN TRADE {data.get('ticker','?')}: {', '.join(data.get('reason_codes',[])[:1])}."
-    return f"{event} {data.get('ticker','?')}"
+        p1 = data.get("p1"); p2 = data.get("p2")
+        p1s = _pct(p1); p2s = _pct(p2)
+        return f"GEEN TRADE {t}: {rc}. p1 {p1s}, p2 {p2s}."
+
+    return f"{event} {t}"
 
 async def notify(event: str, data: dict) -> None:
     _write_jsonl({"ts": _ts(), "event": event, "data": data})
