@@ -20,6 +20,79 @@ def _write_jsonl(obj: dict) -> None:
         # logging mag nooit de flow breken
         pass
 
+def _pct0(x):
+    try:
+        return f"{round(float(x)*100):d}%"
+    except Exception:
+        return "nvt"
+
+def _num2(x):
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return "?"
+
+# Vertaal reason codes naar gewone taal
+REASON_HUMAN = {
+    "COST_TOO_HIGH": "kosten te hoog",
+    "SCORE_LOW": "score te laag",
+    "NO_EDGE_PERSISTENCE": "momentum hield niet stand",
+    "EV_WEAK": "verwachte waarde te laag",
+    "TOD_FAIL": "tijdslot-regels",
+    "LIQUIDITY_FAIL": "te weinig handel",
+    "RISK_FAIL": "risico buiten bereik",
+    "REGIME_FAIL": "markt ongunstig",
+    "TECHNIQUE_FAIL": "patroon onvoldoende",
+    "COMPLIANCE_FAIL": "compliance-regel",
+    "MARKET_SAFETY_FAIL": "volume te laag",
+    "LATENCY_VWAP_FAIL": "quote/VWAP check",
+    "DATA_FAIL": "data klopt niet",
+}
+
+def _friendly_reasons(codes):
+    txts = []
+    for c in (codes or []):
+        t = REASON_HUMAN.get(c, c.replace("_", " ").lower())
+        if t not in txts:
+            txts.append(t)
+        if len(txts) >= 2:  # max 2 redenen tonen
+            break
+    return ", ".join(txts) if txts else "-"
+
+def _human(event: str, data: dict) -> str:
+    t   = str(data.get("ticker", "?"))
+    rc  = _friendly_reasons(data.get("reason_codes"))
+    ent = data.get("entry"); stp = data.get("stop"); sz = data.get("size")
+    p1  = data.get("p1"); p2 = data.get("p2"); ev = data.get("ev")
+
+    ents = _num2(ent); stps = _num2(stp); szs = str(sz) if sz is not None else "?"
+
+    if event == "ENTRY_MKT":
+        # Kort, duidelijk, menselijk
+        line1 = f"Koop {t}. Instap {ents}, stop {stps}, grootte {szs}."
+        line2 = "Doel: +1% snel wat winst nemen, daarna de rest laten meelopen."
+        extra = []
+        if p1 is not None: extra.append(f"kans +1% ≈ {_pct0(p1)}")
+        if p2 is not None: extra.append(f"+2% ≈ {_pct0(p2)}")
+        if ev is not None: extra.append(f"EV ≈ {_pct0(ev)}")
+        line3 = f"Waarom: {rc}." + (f" ({'; '.join(extra)})" if extra else "")
+        return "\n".join([line1, line2, line3])
+
+    if event == "NO_TRADE":
+        line1 = f"Geen trade in {t}."
+        line2 = f"Waarom: {rc}."
+        extra = []
+        if p1 is not None: extra.append(f"+1% ≈ {_pct0(p1)}")
+        if p2 is not None: extra.append(f"+2% ≈ {_pct0(p2)}")
+        line3 = f"Inschatting: {', '.join(extra)}." if extra else ""
+        return "\n".join([line1, line2, line3]).strip()
+
+    if event == "TP1_HIT":
+        return f"{t}: +1% geraakt, helft verkocht. Stop naar instap."
+    if event == "STOP_HIT":
+        return f"{t}: stop geraakt. Trade klaar."
+    return f"{event} {t}"
+
 async def _send_tg(text: str) -> None:
     if not (TG_ENABLED and TG_BOT_TOKEN and TG_CHAT_ID):
         return
@@ -32,38 +105,6 @@ async def _send_tg(text: str) -> None:
         # netwerkfouten negeren (non-blocking)
         pass
 
-def _pct(x):
-    try:
-        return f"{x*100:.2f}%"
-    except Exception:
-        return "n/a"
-
-def _human(event: str, data: dict) -> str:
-    t   = data.get("ticker","?")
-    rc  = ", ".join(data.get("reason_codes", [])[:2]) or "-"
-    ent = data.get("entry"); stp = data.get("stop"); sz = data.get("size")
-    ev  = data.get("ev")
-
-    if event == "ENTRY_MKT":
-        ent_s = f"{ent:.2f}" if isinstance(ent,(int,float)) else "?"
-        stp_s = f"{stp:.2f}" if isinstance(stp,(int,float)) else "?"
-        sz_s  = f"{sz}" if sz else "?"
-        ev_s  = _pct(ev)
-        return f"KOOP {t}: @ {ent_s}, SL {stp_s}, size {sz_s}. TP1 = +1% → halve winst. EV {ev_s}. Reden: {rc}."
-
-    if event == "TP1_HIT":
-        return f"{t}: +1% geraakt, helft verkocht. Stop naar instap."
-
-    if event == "STOP_HIT":
-        return f"{t}: stop geraakt. Trade klaar."
-
-    if event == "NO_TRADE":
-        p1 = data.get("p1"); p2 = data.get("p2")
-        p1s = _pct(p1); p2s = _pct(p2)
-        return f"GEEN TRADE {t}: {rc}. p1 {p1s}, p2 {p2s}."
-
-    return f"{event} {t}"
-
 async def notify(event: str, data: dict) -> None:
-    _write_jsonl({"ts": _ts(), "event": event, "data": data})
-    await _send_tg(_human(event, data))
+    _write_jsonl({"ts": _ts(), "event": event, "data": data})  # altijd loggen
+    await _send_tg(_human(event, data))                        # Telegram (opt-in)
