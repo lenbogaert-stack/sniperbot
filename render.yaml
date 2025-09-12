@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: sniperbot-api
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /healthz
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: EXEC_MODE
+        value: MARKET_ONLY
+      - key: LIVE_TRADING
+        value: "false"
+      - key: APP_VERSION
+        value: "v3.2"
+      - key: TG_ENABLED
+        value: "false"
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TG_CHAT_ID
+        sync: false
