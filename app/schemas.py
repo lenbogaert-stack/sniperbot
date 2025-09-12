@@ -55,7 +55,7 @@ class DecideOutput(BaseModel):
     ticker: str
     sniper_score: float
     gates: Gates
-    mode: Literal["MARKET_ONLY","MARKETABLE_LIMIT"]
+    mode: Optional[Literal["MARKET_ONLY","MARKETABLE_LIMIT"]] = "MARKET_ONLY"
     orders: Optional[OrdersSpec] = None
     entry: Optional[float] = None
     stop_loss: Optional[float] = None
