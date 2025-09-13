@@ -20,9 +20,7 @@ def _write_jsonl(obj: dict) -> None:
         # logging mag nooit de flow breken
         pass
 
-# Percentages:
-# - p1/p2: hele procenten (bv. 67%)
-# - EV: met teken en 2 decimalen (bv. +0,11%)
+# p1/p2: hele %, EV: teken + 2 decimalen
 def _pct_int(x):
     try:
         return f"{round(float(x)*100):d}%"
@@ -41,7 +39,7 @@ def _num2(x):
     except Exception:
         return "?"
 
-# Vertaal reason codes naar gewone taal (max 2 tonen)
+# Reason-codes naar gewone taal (max 2 tonen)
 REASON_HUMAN = {
     "COST_TOO_HIGH": "kosten te hoog",
     "SCORE_LOW": "score te laag",
@@ -72,6 +70,7 @@ def _friendly_reasons(codes):
     return ", ".join(txts) if txts else "-"
 
 def _human(event: str, data: dict) -> str:
+    # Algemene velden
     t   = str(data.get("ticker", "?"))
     rc  = _friendly_reasons(data.get("reason_codes"))
     ent = data.get("entry"); stp = data.get("stop"); sz = data.get("size")
@@ -79,6 +78,7 @@ def _human(event: str, data: dict) -> str:
 
     ents = _num2(ent); stps = _num2(stp); szs = str(sz) if sz is not None else "?"
 
+    # --- Specifieke events ---
     if event == "ENTRY_MKT":
         line1 = f"Koop {t}. Instap {ents}, stop {stps}, grootte {szs}."
         line2 = "Doel: +1% snel wat winst nemen, daarna de rest laten meelopen."
@@ -99,16 +99,18 @@ def _human(event: str, data: dict) -> str:
         line3 = f"Inschatting: {', '.join(extra)}." if extra else ""
         return "\n".join([line1, line2, line3]).strip()
 
+    if event == "SCAN":
+        n   = data.get("n", 0)
+        trd = data.get("tradeables", 0)
+        top = data.get("top") or []
+        tops = ", ".join(top[:3]) if top else "-"
+        return f"Scan: {n} bekeken, {trd} kansrijk. Top: {tops}."
+
     if event == "TP1_HIT":
         return f"{t}: +1% geraakt, helft verkocht. Stop naar instap."
     if event == "STOP_HIT":
         return f"{t}: stop geraakt. Trade klaar."
     return f"{event} {t}"
-    
-    if event == "SCAN":
-        top = data.get("top") or []
-        return f"Scan: {data.get('n',0)} bekeken, {data.get('tradeables',0)} kansrijk. Top: {', '.join(top[:3]) or '-'}."
-
 
 async def _send_tg(text: str) -> None:
     if not (TG_ENABLED and TG_BOT_TOKEN and TG_CHAT_ID):
