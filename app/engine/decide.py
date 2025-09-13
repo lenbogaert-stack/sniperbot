@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 from typing import Tuple, Dict
 from .utils import time_of_day_spread_limit_bps, rvol_score, catalyst_bonus, vwap_score, regime_tailwind
+import os
+ACCOUNT_EQUITY = float(os.getenv("ACCOUNT_EQUITY_USD", "100000"))  # bv. 100k
+RISK_PCT = float(os.getenv("TRADE_RISK_PCT", "0.005"))             # 0.5% per trade
 
 def cost_break_even(cost_profile: str, commission_side_bps: int, spread_bps: float, slippage_guard_bps: int) -> float:
     # commissies*2 + fx + spread + slippage (als percentages)
@@ -149,7 +152,7 @@ def decide(inp, universe_size: int = 150) -> dict:
     entry = inp.price
     stop = min(entry*(1 - max(0.0045, 0.5*inp.atr_pct)), inp.vwap*(1-0.0015), inp.low*(1-0.0010))
     per_share_risk = entry - stop
-    risk_cash = 100_000 * 0.005  # 0.5% van fictieve 100k
+    risk_cash = ACCOUNT_EQUITY * RISK_PCT
     size = max(1, int(risk_cash / max(0.01, per_share_risk)))
 
     costs = {
