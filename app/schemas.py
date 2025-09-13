@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, Literal, Dict
+from typing import Optional, Literal, Dict, List
 
 class MarketRegime(BaseModel):
     spy_pct: float = Field(..., description="SPY change as decimal (0.004 = +0.4%)")
@@ -63,7 +63,22 @@ class DecideOutput(BaseModel):
     costs: Optional[dict] = None
     probs: Optional[dict] = None
     ev_estimate: Optional[dict] = None
-    reason_codes: list[str]
+    reason_codes: List[str]
     meta: Optional[Meta] = None
     rejections: Optional[dict] = None
     explain_human: str
+
+# --- Scan API ---
+
+class ScanRequest(BaseModel):
+    universe_name: Optional[str] = "custom"
+    top_k: int = 3
+    candidates: List[DecideInput]
+
+class ScanResponse(BaseModel):
+    universe_name: str
+    scanned: int
+    tradeables: int
+    top: List[DecideOutput]
+    summary: Dict[str, object]
+    meta: Meta
