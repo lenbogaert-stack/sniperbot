@@ -20,9 +20,18 @@ def _write_jsonl(obj: dict) -> None:
         # logging mag nooit de flow breken
         pass
 
-def _pct0(x):
+# Percentages:
+# - p1/p2: hele procenten (bv. 67%)
+# - EV: met teken en 2 decimalen (bv. +0,11%)
+def _pct_int(x):
     try:
         return f"{round(float(x)*100):d}%"
+    except Exception:
+        return "nvt"
+
+def _pct2_sign(x):
+    try:
+        return f"{float(x)*100:+.2f}%"
     except Exception:
         return "nvt"
 
@@ -32,7 +41,7 @@ def _num2(x):
     except Exception:
         return "?"
 
-# Vertaal reason codes naar gewone taal
+# Vertaal reason codes naar gewone taal (max 2 tonen)
 REASON_HUMAN = {
     "COST_TOO_HIGH": "kosten te hoog",
     "SCORE_LOW": "score te laag",
@@ -47,6 +56,9 @@ REASON_HUMAN = {
     "MARKET_SAFETY_FAIL": "volume te laag",
     "LATENCY_VWAP_FAIL": "quote/VWAP check",
     "DATA_FAIL": "data klopt niet",
+    "EV_OK": "verwachte waarde oké",
+    "COST_OK": "kosten oké",
+    "EDGE_2OF3": "momentum sterk",
 }
 
 def _friendly_reasons(codes):
@@ -55,7 +67,7 @@ def _friendly_reasons(codes):
         t = REASON_HUMAN.get(c, c.replace("_", " ").lower())
         if t not in txts:
             txts.append(t)
-        if len(txts) >= 2:  # max 2 redenen tonen
+        if len(txts) >= 2:
             break
     return ", ".join(txts) if txts else "-"
 
@@ -68,13 +80,12 @@ def _human(event: str, data: dict) -> str:
     ents = _num2(ent); stps = _num2(stp); szs = str(sz) if sz is not None else "?"
 
     if event == "ENTRY_MKT":
-        # Kort, duidelijk, menselijk
         line1 = f"Koop {t}. Instap {ents}, stop {stps}, grootte {szs}."
         line2 = "Doel: +1% snel wat winst nemen, daarna de rest laten meelopen."
         extra = []
-        if p1 is not None: extra.append(f"kans +1% ≈ {_pct0(p1)}")
-        if p2 is not None: extra.append(f"+2% ≈ {_pct0(p2)}")
-        if ev is not None: extra.append(f"EV ≈ {_pct0(ev)}")
+        if p1 is not None: extra.append(f"kans +1% ≈ {_pct_int(p1)}")
+        if p2 is not None: extra.append(f"+2% ≈ {_pct_int(p2)}")
+        if ev is not None: extra.append(f"EV ≈ {_pct2_sign(ev)}")
         line3 = f"Waarom: {rc}." + (f" ({'; '.join(extra)})" if extra else "")
         return "\n".join([line1, line2, line3])
 
@@ -82,8 +93,9 @@ def _human(event: str, data: dict) -> str:
         line1 = f"Geen trade in {t}."
         line2 = f"Waarom: {rc}."
         extra = []
-        if p1 is not None: extra.append(f"+1% ≈ {_pct0(p1)}")
-        if p2 is not None: extra.append(f"+2% ≈ {_pct0(p2)}")
+        if p1 is not None: extra.append(f"+1% ≈ {_pct_int(p1)}")
+        if p2 is not None: extra.append(f"+2% ≈ {_pct_int(p2)}")
+        if ev is not None: extra.append(f"EV ≈ {_pct2_sign(ev)}")
         line3 = f"Inschatting: {', '.join(extra)}." if extra else ""
         return "\n".join([line1, line2, line3]).strip()
 
