@@ -82,3 +82,18 @@ class ScanResponse(BaseModel):
     top: List[DecideOutput]
     summary: Dict[str, object]
     meta: Meta
+
+# ... (bestaande imports/modellen blijven staan)
+
+class ExecuteRequest(BaseModel):
+    ticker: str
+    shares: int
+    entry: float
+    stop: float
+    confirm: bool = False  # False = preflight (geen order), True = sturen
+
+class ExecuteResponse(BaseModel):
+    ok: bool
+    mode: Literal["DRY_RUN","LIVE"]
+    entry_result: dict
+    stop_result: dict
