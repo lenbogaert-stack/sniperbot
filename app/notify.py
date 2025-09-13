@@ -104,6 +104,11 @@ def _human(event: str, data: dict) -> str:
     if event == "STOP_HIT":
         return f"{t}: stop geraakt. Trade klaar."
     return f"{event} {t}"
+    
+    if event == "SCAN":
+        top = data.get("top") or []
+        return f"Scan: {data.get('n',0)} bekeken, {data.get('tradeables',0)} kansrijk. Top: {', '.join(top[:3]) or '-'}."
+
 
 async def _send_tg(text: str) -> None:
     if not (TG_ENABLED and TG_BOT_TOKEN and TG_CHAT_ID):
