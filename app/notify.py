@@ -120,6 +120,12 @@ def _human(event: str, data: dict) -> str:
         return f"{t}: stop geraakt. Trade klaar."
     return f"{event} {t}"
 
+    if event == "EXEC_SENT":
+        live = data.get("live")
+        t, e, s, sz = data.get("ticker"), data.get("entry"), data.get("stop"), data.get("size")
+        mode = "live" if live else "sim"
+        return f"Order gestuurd ({mode}): koop {t}, {sz} stuks @~{_num2(e)}, stop { _num2(s) }."
+
 def _dedup_key(event: str, data: dict) -> str:
     t = data.get("ticker")
     e = data.get("entry"); s = data.get("stop"); sz = data.get("size")
