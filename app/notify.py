@@ -1,13 +1,19 @@
-import os, json, httpx
+import os, json, httpx, time
+from collections import deque
 from datetime import datetime, timezone
 
-# Opt-in Telegram; in CI blijft dit uit
-TG_ENABLED     = os.getenv("TG_ENABLED", "false").lower() == "true"
-TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID     = os.getenv("TG_CHAT_ID", "")
-TG_TIMEOUT_SEC = float(os.getenv("TG_TIMEOUT_SEC", "1.0"))
-TG_SINK_JSONL  = os.getenv("TG_SINK_JSONL", "logs/events.jsonl")
+# ── Config via env ──────────────────────────────────────────────────────────────
+TG_ENABLED      = os.getenv("TG_ENABLED", "false").lower() == "true"
+TG_BOT_TOKEN    = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID      = os.getenv("TG_CHAT_ID", "")
+TG_TIMEOUT_SEC  = float(os.getenv("TG_TIMEOUT_SEC", "1.0"))
+TG_SINK_JSONL   = os.getenv("TG_SINK_JSONL", "logs/events.jsonl")
+TG_DEDUP_SEC    = float(os.getenv("TG_DEDUP_SEC", "10"))   # binnen X sec geen dubbele melding
 
+# Dedup cache (in-memory, best-effort)
+_recent = deque(maxlen=128)  # items: (key, ts)
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def _ts() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -20,7 +26,9 @@ def _write_jsonl(obj: dict) -> None:
         # logging mag nooit de flow breken
         pass
 
-# p1/p2: hele %, EV: teken + 2 decimalen
+# Percentages:
+# - p1/p2: hele procenten (bv. 67%)
+# - EV: met teken en 2 decimalen (bv. +0,11%)
 def _pct_int(x):
     try:
         return f"{round(float(x)*100):d}%"
@@ -39,7 +47,7 @@ def _num2(x):
     except Exception:
         return "?"
 
-# Reason-codes naar gewone taal (max 2 tonen)
+# Redencodes → gewone taal (max 2 tonen)
 REASON_HUMAN = {
     "COST_TOO_HIGH": "kosten te hoog",
     "SCORE_LOW": "score te laag",
@@ -78,7 +86,7 @@ def _human(event: str, data: dict) -> str:
 
     ents = _num2(ent); stps = _num2(stp); szs = str(sz) if sz is not None else "?"
 
-    # --- Specifieke events ---
+    # Specifieke events
     if event == "ENTRY_MKT":
         line1 = f"Koop {t}. Instap {ents}, stop {stps}, grootte {szs}."
         line2 = "Doel: +1% snel wat winst nemen, daarna de rest laten meelopen."
@@ -112,6 +120,16 @@ def _human(event: str, data: dict) -> str:
         return f"{t}: stop geraakt. Trade klaar."
     return f"{event} {t}"
 
+def _dedup_key(event: str, data: dict) -> str:
+    t = data.get("ticker")
+    e = data.get("entry"); s = data.get("stop"); sz = data.get("size")
+    # Rond af om mini-verschillen te dempen
+    try: e = round(float(e), 2)
+    except Exception: e = e or 0
+    try: s = round(float(s), 2)
+    except Exception: s = s or 0
+    return f"{event}|{t}|{e}|{s}|{sz}"
+
 async def _send_tg(text: str) -> None:
     if not (TG_ENABLED and TG_BOT_TOKEN and TG_CHAT_ID):
         return
@@ -124,6 +142,23 @@ async def _send_tg(text: str) -> None:
         # netwerkfouten negeren (non-blocking)
         pass
 
+# ── Publieke notify ────────────────────────────────────────────────────────────
 async def notify(event: str, data: dict) -> None:
-    _write_jsonl({"ts": _ts(), "event": event, "data": data})  # altijd loggen
-    await _send_tg(_human(event, data))                        # Telegram (opt-in)
+    # Dedup: sla identieke meldingen binnen TG_DEDUP_SEC over
+    key = _dedup_key(event, data)
+    now = time.time()
+    # Verwijder oude entries
+    try:
+        while _recent and now - _recent[0][1] > TG_DEDUP_SEC:
+            _recent.popleft()
+        if any(k == key for k, ts in _recent):
+            _write_jsonl({"ts": _ts(), "event": event, "data": data, "skipped": "duplicate"})
+            return
+        _recent.append((key, now))
+    except Exception:
+        # Dedup faalt? Ga gewoon door (best-effort)
+        pass
+
+    # Log altijd (best effort), stuur Telegram opt-in
+    _write_jsonl({"ts": _ts(), "event": event, "data": data})
+    await _send_tg(_human(event, data))
