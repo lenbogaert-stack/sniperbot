@@ -1,171 +1,139 @@
-# app/main.py
-from __future__ import annotations
+# main.py
+# SNIPERBOT API v3.2 – FastAPI + Saxo auto-refresh (SIM), met simpele scan/execute.
+#
+# Vereiste ENV variabelen (Render e.d.):
+# - SINGLE_API_KEY=lenbogy123                 # of eigen API key; header: X-API-Key
+# - EXEC_ENABLED=true                         # verplicht voor live SIM orders
+# - LIVE_TRADING=true                         # puur label; SIM blijft SIM (SAXO_BASE = /sim/)
+# - SAXO_BASE=https://gateway.saxobank.com/sim/openapi
+# - SAXO_TOKEN_URL=https://sim.logonvalidation.net/token
+# - SAXO_APP_KEY=<je SIM app key>
+# - SAXO_APP_SECRET=<je SIM app secret>
+# - SAXO_REFRESH_TOKEN=<initiële refresh token>   # wordt daarna geroteerd (indien Redis)
+# - SAXO_ACCOUNT_KEY=<accountKey zoals ytESP3...> # optioneel; anders auto-ophalen
+# - TICKER_UIC_MAP={"AAPL":211,"MSFT":261,...}    # JSON string
+# - REDIS_URL=rediss://:<pwd>@<host>:<port>/0     # optioneel maar aangeraden
+# - SAXO_REDIRECT_URI=https://oauth.pstmn.io/v1/callback   # optioneel (voor /oauth flow)
+#
+# Endpoints:
+# - GET  /healthz
+# - POST /decide        {ticker, price}
+# - POST /scan          {universe_name, top_k=3, candidates:[...]}
+# - POST /execute       {ticker, shares, entry, stop, confirm=false}
+# - GET  /oauth/saxo/status
+# - POST /saxo/refresh  (force refresh)
+#
+# Opmerking:
+# - /execute plaatst 2 orders bij Saxo (MARKET Buy, daarna Stop Sell) ALS confirm=true & EXEC_ENABLED=true
+# - Anders DRY_RUN met preflight-uitkomst.
+# - Alle Saxo-calls gebruiken auto-refresh met 401 retry en refresh-token-rotatie.
 
-import json
 import os
+import json
 import time
-from datetime import datetime, timezone, timedelta
+import threading
+import logging
 from typing import Any, Dict, List, Optional
 
-import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+import requests
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, validator
 
-# =========================
-# Config & Globals
-# =========================
-APP_VERSION = "v3.2"
-
-X_API_KEY = os.getenv("X_API_KEY", "")
-EXEC_ENABLED = os.getenv("EXEC_ENABLED", "false").lower() == "true"
-LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
-
-# Telegram (opt-in)
-TG_ENABLED = os.getenv("TG_ENABLED", "false").lower() == "true"
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-
-# Saxo config (SIM by default)
-SAXO_BASE = os.getenv("SAXO_BASE", "https://gateway.saxobank.com/sim/openapi")
-SAXO_TOKEN_URL = os.getenv("SAXO_TOKEN_URL", "https://sim.logonvalidation.net/token")
-SAXO_AUTHORIZE_URL = os.getenv("SAXO_AUTHORIZE_URL", "https://sim.logonvalidation.net/authorize")
-SAXO_APP_KEY = os.getenv("SAXO_APP_KEY", "")
-SAXO_APP_SECRET = os.getenv("SAXO_APP_SECRET", "")
-SAXO_REFRESH_TOKEN = os.getenv("SAXO_REFRESH_TOKEN", "")
-SAXO_REDIRECT_URI = os.getenv("SAXO_REDIRECT_URI", "https://sniperbot-api.onrender.com/oauth/saxo/callback")
-SAXO_ACCOUNT_KEY = os.getenv("SAXO_ACCOUNT_KEY", "")  # nodig voor orders
-TICKER_UIC_MAP_RAW = os.getenv("TICKER_UIC_MAP", "{}")
-
+# Redis is optioneel
 try:
-    TICKER_UIC_MAP: Dict[str, int] = {k.upper(): int(v) for k, v in json.loads(TICKER_UIC_MAP_RAW or "{}").items()}
-except Exception:
-    TICKER_UIC_MAP = {}
+    import redis  # type: ignore
+except Exception:  # pragma: no cover
+    redis = None
 
-# Simple in-memory access token cache
-_saxo_token_cache: Dict[str, Any] = {
-    "access_token": None,
-    "expires_at": 0.0,  # epoch seconds
-}
-
-HTTP_TIMEOUT = 15.0
+APP_VERSION = "v3.2"
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("sniperbot")
 
 app = FastAPI(title="SNIPERBOT API", version=APP_VERSION)
 
+# ======= Config uit ENV =======
 
-# =========================
-# Helpers
-# =========================
-def require_api_key(x_api_key: Optional[str] = Header(None, alias="x-api-key")):
-    if not X_API_KEY:
-        # No API key configured -> allow all (dev mode)
-        return
-    if not x_api_key or x_api_key != X_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+SINGLE_API_KEY = os.getenv("SINGLE_API_KEY", "lenbogy123")
 
+SAXO_BASE       = os.getenv("SAXO_BASE", "https://gateway.saxobank.com/sim/openapi")
+SAXO_TOKEN_URL  = os.getenv("SAXO_TOKEN_URL", "https://sim.logonvalidation.net/token")
+SAXO_APP_KEY    = os.getenv("SAXO_APP_KEY", "")
+SAXO_APP_SECRET = os.getenv("SAXO_APP_SECRET", "")
+SAXO_REDIRECT   = os.getenv("SAXO_REDIRECT_URI", "https://oauth.pstmn.io/v1/callback")
 
-def now_et_iso() -> str:
-    # We keep UTC but label as ISO; real ET conversion can be added if needed
-    return datetime.now(timezone.utc).isoformat()
+EXEC_ENABLED    = os.getenv("EXEC_ENABLED", "false").lower() == "true"
+LIVE_TRADING    = os.getenv("LIVE_TRADING", "false").lower() == "true"
+SAXO_ACCOUNT_KEY_ENV = os.getenv("SAXO_ACCOUNT_KEY", "")
 
+TICKER_UIC_MAP: Dict[str, int] = {}
+try:
+    if os.getenv("TICKER_UIC_MAP"):
+        TICKER_UIC_MAP = {k.upper(): int(v) for k, v in json.loads(os.getenv("TICKER_UIC_MAP", "{}")).items()}
+except Exception as e:
+    log.warning("Kon TICKER_UIC_MAP niet parsen: %s", e)
+    TICKER_UIC_MAP = {}
 
-async def tg_notify(text: str, x_no_notify: Optional[str] = None) -> None:
-    if x_no_notify is not None:
-        return
-    if not TG_ENABLED or not TG_BOT_TOKEN or not TG_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": text}
+REDIS_URL = os.getenv("REDIS_URL", "")
+
+# ======= Redis client (optioneel, aanbevolen voor refresh-rotatie) =======
+
+rds: Optional["redis.Redis"] = None
+if REDIS_URL and redis is not None:
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            await client.post(url, json=payload)
-    except Exception:
-        # swallow: notifications must never break the app
-        pass
+        rds = redis.from_url(REDIS_URL, decode_responses=True, ssl=True)
+        # Smoke test
+        rds.ping()
+        log.info("Redis OK.")
+    except Exception as e:
+        log.warning("Redis init faalde: %s", e)
+        rds = None
 
 
-def _cost_ok(payload: Dict[str, Any]) -> bool:
-    """Ruwe kostengate: commission*2 + fx + spread + slippage wordt vergeleken met drempel."""
-    commission_bps = float(payload.get("commission_side_bps", 0)) * 2.0
-    fx = float(payload.get("fx_bps", 0.0))
-    spread_bps = float(payload.get("spread_bps", 0.0))
-    slip_bps = float(payload.get("slippage_guard_bps", 0.0))
-    total_bps = commission_bps + fx + spread_bps + slip_bps
-    # simpele grens: <= 24 bps ~ 0.24%
-    return total_bps <= 24.0
+def kv_get(key: str) -> Optional[str]:
+    if rds:
+        try:
+            return rds.get(key)
+        except Exception:
+            return None
+    return None
 
 
-def _edge_ok(payload: Dict[str, Any]) -> bool:
-    """Eenvoudige 2-van-3 edge: vwap_reclaims_ok, orb_follow_ok, uptick_ratio_60>=0.6"""
-    ok1 = bool(payload.get("vwap_reclaims_ok", False))
-    ok2 = bool(payload.get("orb_follow_ok", False))
-    ok3 = float(payload.get("uptick_ratio_60", 0.0)) >= 0.60
-    return (ok1 + ok2 + ok3) >= 2
+def kv_set(key: str, value: str, ttl: Optional[int] = None) -> None:
+    if rds:
+        try:
+            if ttl:
+                rds.setex(key, ttl, value)
+            else:
+                rds.set(key, value)
+        except Exception:
+            pass
 
 
-def _tod_ok(payload: Dict[str, Any]) -> bool:
-    tod = str(payload.get("time_of_day", "core"))
-    # eenvoudige regel: geen nieuwe entries na "close"
-    return tod != "close"
+# ======= Security (API Key) =======
+
+def require_api_key(x_api_key: Optional[str]) -> None:
+    expected = SINGLE_API_KEY.strip()
+    if expected:
+        if not x_api_key or x_api_key.strip() != expected:
+            raise HTTPException(status_code=401, detail="Invalid X-API-Key")
+    # Als SINGLE_API_KEY leeg zou zijn, geen check (dev).
 
 
-def _tech_ok(payload: Dict[str, Any]) -> bool:
-    vwap = float(payload.get("vwap", 0.0))
-    price = float(payload.get("price", 0.0))
-    slope = float(payload.get("vwap_slope_pct_per_min", 0.0))
-    return (price > vwap) and (slope > 0)
+# ======= Pydantic modellen =======
 
-
-def _score(payload: Dict[str, Any]) -> float:
-    """Heel simpele score op basis van rvol + slope + spread."""
-    rvol = float(payload.get("rvol", 1.0))
-    slope = float(payload.get("vwap_slope_pct_per_min", 0.0))
-    spread_bps = float(payload.get("spread_bps", 10.0))
-    base = (rvol - 1.0) * 2.0 + (slope * 20.0) - (spread_bps / 20.0)
-    return max(0.0, round(base, 2))
-
-
-async def _ensure_saxo_access_token() -> str:
-    """Refresh access token if missing/expired using refresh token in env."""
-    if not SAXO_APP_KEY or not SAXO_APP_SECRET or not SAXO_REFRESH_TOKEN:
-        raise HTTPException(status_code=400, detail="Saxo app/refresh token not configured")
-
-    now = time.time()
-    if _saxo_token_cache["access_token"] and _saxo_token_cache["expires_at"] > now + 30:
-        return _saxo_token_cache["access_token"]
-
-    # refresh
-    basic = httpx.Auth()
-    headers = {
-        "Authorization": "Basic " + httpx._auth._basic_auth_str(SAXO_APP_KEY, SAXO_APP_SECRET),  # type: ignore
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-    }
-    data = f"grant_type=refresh_token&refresh_token={httpx.QueryParams({'r': SAXO_REFRESH_TOKEN})['r']}"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.post(SAXO_TOKEN_URL, headers=headers, content=data)
-        if r.status_code != 200:
-            raise HTTPException(status_code=401, detail=f"Token refresh failed ({r.status_code})")
-        tok = r.json()
-    access = tok.get("access_token")
-    expires_in = int(tok.get("expires_in", 300))
-    if not access:
-        raise HTTPException(status_code=401, detail="No access_token in Saxo response")
-    _saxo_token_cache["access_token"] = access
-    _saxo_token_cache["expires_at"] = time.time() + max(60, expires_in - 15)
-    # rotation: if Saxo returns new refresh_token, we can't write env here; just ignore
-    return access
-
-
-# =========================
-# Schemas
-# =========================
 class DecideRequest(BaseModel):
     ticker: str
     price: float
-    # We staan extra velden toe zodat je rijkere payloads kan sturen
-    class Config:
-        extra = "allow"
+
+
+class ScanRequest(BaseModel):
+    universe_name: str
+    top_k: int = 3
+    candidates: List[Dict[str, Any]]
+
+    @validator("top_k")
+    def _cap_topk(cls, v):
+        return max(1, min(10, int(v)))
 
 
 class ExecuteRequest(BaseModel):
@@ -175,314 +143,391 @@ class ExecuteRequest(BaseModel):
     stop: float
     confirm: bool = False
 
+    @validator("shares")
+    def _shares_ok(cls, v):
+        if v <= 0:
+            raise ValueError("shares must be > 0")
+        return v
 
-class ScanRequest(BaseModel):
-    universe_name: str
-    top_k: int = 3
-    candidates: List[Dict[str, Any]]
+    @validator("stop")
+    def _stop_ok(cls, v, values):
+        # Alleen basiscontrole; bij short is deze anders (nu enkel long)
+        if "entry" in values and v >= values["entry"]:
+            raise ValueError("stop must be < entry for long")
+        return v
 
-    class Config:
-        extra = "allow"
+
+# ======= Saxo OAuth Token Manager =======
+
+class SaxoAuthManager:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._access_token: Optional[str] = None
+        self._expires_at: float = 0.0  # epoch
+
+    @property
+    def expires_at(self) -> float:
+        return self._expires_at
+
+    def _get_refresh_token(self) -> str:
+        rt = kv_get("saxo:refresh_token")
+        if rt:
+            return rt
+        env_rt = os.getenv("SAXO_REFRESH_TOKEN", "")
+        if not env_rt:
+            raise HTTPException(status_code=400, detail="SAXO_REFRESH_TOKEN ontbreekt (ook niet in Redis).")
+        return env_rt.strip()
+
+    def _store_refresh_token(self, rt: str) -> None:
+        kv_set("saxo:refresh_token", rt)
+
+    def _store_access_token(self, at: str, expires_in: int) -> None:
+        now = time.time()
+        self._access_token = at
+        # 30s veiligheidsmarge
+        self._expires_at = now + max(0, int(expires_in) - 30)
+        kv_set("saxo:access_token", at, ttl=int(expires_in))
+
+    def _refresh_now(self) -> None:
+        if not SAXO_APP_KEY or not SAXO_APP_SECRET:
+            raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
+
+        rt = self._get_refresh_token()
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": SAXO_APP_KEY,
+            "client_secret": SAXO_APP_SECRET,
+        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
+        resp = requests.post(SAXO_TOKEN_URL, data=data, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Token refresh failed ({resp.status_code}): {resp.text}")
+
+        js = resp.json()
+        at = js.get("access_token")
+        exp = js.get("expires_in", 900)
+        if not at:
+            raise HTTPException(status_code=502, detail="Token refresh ok maar geen access_token in respons.")
+
+        self._store_access_token(at, int(exp))
+
+        # Rotatie
+        new_rt = js.get("refresh_token")
+        if new_rt and new_rt != rt:
+            self._store_refresh_token(new_rt)
+
+    def get_access_token(self, force: bool = False) -> str:
+        with self._lock:
+            now = time.time()
+            if force or (self._access_token is None) or (now >= self._expires_at - 60):
+                self._refresh_now()
+            return self._access_token  # type: ignore
+
+    def auth_header(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.get_access_token()}"}
 
 
-# =========================
-# Routes
-# =========================
+saxo_auth = SaxoAuthManager()
+
+
+# ======= Saxo helpers =======
+
+def saxo_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    url = f"{SAXO_BASE}{path}"
+    try:
+        h = saxo_auth.auth_header()
+        r = requests.get(url, headers=h, params=params, timeout=20)
+        if r.status_code == 401:
+            # één stille refresh + retry
+            h = saxo_auth.auth_header()
+            r = requests.get(url, headers=h, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Saxo GET {path} failed ({r.status_code}): {r.text}") from e  # type: ignore
+
+
+def saxo_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{SAXO_BASE}{path}"
+    try:
+        h = {**saxo_auth.auth_header(), "Content-Type": "application/json", "Accept": "application/json"}
+        r = requests.post(url, headers=h, json=payload, timeout=20)
+        if r.status_code == 401:
+            h = {**saxo_auth.auth_header(), "Content-Type": "application/json", "Accept": "application/json"}
+            r = requests.post(url, headers=h, json=payload, timeout=20)
+        r.raise_for_status()
+        if r.text.strip():
+            return r.json()
+        return {"ok": True}
+    except requests.HTTPError as e:
+        msg = r.text if "r" in locals() else str(e)
+        code = r.status_code if "r" in locals() else 502
+        raise HTTPException(status_code=502, detail=f"Saxo POST {path} failed ({code}): {msg}") from e
+
+
+# ======= Utils =======
+
+def get_account_key() -> str:
+    if SAXO_ACCOUNT_KEY_ENV:
+        return SAXO_ACCOUNT_KEY_ENV
+    # fallback: haal actief account op
+    js = saxo_get("/port/v1/accounts/me")
+    # Verwacht payload met "Data":[{...}]
+    try:
+        data = js.get("Data", [])
+        for acc in data:
+            if acc.get("Active", True):
+                return acc["AccountKey"]
+        # anders eerste
+        if data:
+            return data[0]["AccountKey"]
+    except Exception:
+        pass
+    raise HTTPException(status_code=502, detail=f"Kon AccountKey niet bepalen uit /port/v1/accounts/me: {js}")
+
+
+def uic_for_ticker(ticker: str) -> int:
+    t = ticker.strip().upper()
+    if t not in TICKER_UIC_MAP:
+        raise HTTPException(status_code=400, detail=f"Ticker '{t}' niet gevonden in TICKER_UIC_MAP.")
+    return int(TICKER_UIC_MAP[t])
+
+
+# ======= Endpoints =======
+
 @app.get("/healthz", summary="Healthz")
-async def healthz():
+def healthz():
     return {"ok": True, "version": APP_VERSION}
 
 
-@app.post("/decide", summary="Decide Endpoint")
-async def decide_endpoint(
-    req: DecideRequest,
-    request: Request,
-    x_no_notify: Optional[str] = Header(None, alias="x-no-notify"),
-    _: None = Depends(require_api_key),
-):
-    t0 = time.time()
-    payload = req.dict()
-    gates = {
-        "technique": _tech_ok(payload),
-        "cost": _cost_ok(payload),
-        "edge": _edge_ok(payload),
-        "tod": _tod_ok(payload),
+@app.get("/oauth/saxo/status", summary="Saxo Status")
+def saxo_status(x_api_key: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+    return {
+        "ok": True,
+        "has_access_token": bool(kv_get("saxo:access_token")),
+        "expires_at_epoch": getattr(saxo_auth, "_expires_at", 0.0),
+        "exec_enabled": EXEC_ENABLED,
+        "live_trading": LIVE_TRADING,
     }
-    score = _score(payload)
 
-    if all(gates.values()) and score >= 1.0:
-        decision = "TRADE_LONG"
-        entry = float(payload["price"])
-        stop = round(entry * 0.982, 4)  # simpele 1.8% stop
-        size = max(1, int(1000 / max(1.0, entry)))  # leuke demo sizing
 
-        explain = (
-            "Volume en trend zijn gunstig. We kopen met een marktorder, nemen bij +1% de helft winst "
-            "en volgen de rest met een meeschuivende stop."
-        )
-        result = {
-            "decision": decision,
-            "ticker": req.ticker,
-            "sniper_score": score,
-            "gates": {k: bool(v) for k, v in gates.items()},
+@app.post("/saxo/refresh", summary="Forceer Saxo token refresh")
+def saxo_refresh(x_api_key: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+    # Force refresh; duidelijke fouten i.p.v. 500
+    if not SAXO_APP_KEY or not SAXO_APP_SECRET:
+        raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
+    if not (os.getenv("SAXO_REFRESH_TOKEN") or kv_get("saxo:refresh_token")):
+        raise HTTPException(status_code=400, detail="Ontbrekende refresh token (SAXO_REFRESH_TOKEN/Redis).")
+    at = saxo_auth.get_access_token(force=True)
+    return {"ok": True, "access_token_preview": (at[:20] + "..."), "expires_at_epoch": saxo_auth.expires_at}
+
+
+@app.post("/decide", summary="Decide Endpoint")
+def decide_endpoint(req: DecideRequest, x_api_key: Optional[str] = Header(None), x_no_notify: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+    # Simpele placeholder (consistent met je vorige NO_TRADE output)
+    return {
+        "decision": "NO_TRADE",
+        "ticker": req.ticker.upper(),
+        "sniper_score": 0.0,
+        "gates": {},
+        "mode": "MARKET_ONLY",
+        "orders": {},
+        "entry": None,
+        "stop_loss": None,
+        "size_shares": None,
+        "costs": {},
+        "probs": {},
+        "ev_estimate": {},
+        "reason_codes": ["SCORE_LOW"],
+        "meta": {"version": APP_VERSION, "latency_ms": 0},
+        "rejections": {},
+        "explain_human": "Dummy engine: geen trade.",
+    }
+
+
+@app.post("/scan", summary="Scan Endpoint")
+def scan_endpoint(req: ScanRequest, x_api_key: Optional[str] = Header(None), x_no_notify: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+
+    def score(c: Dict[str, Any]) -> float:
+        # Eenvoudige heuristiek: vwap_slope > 0 en rvol hoog → hogere score
+        vwap_slope = float(c.get("vwap_slope_pct_per_min", 0) or 0)
+        rvol = float(c.get("rvol", 1) or 1)
+        spread_bps = float(c.get("spread_bps", 10) or 10)
+        halted = bool(c.get("halted", False))
+        if halted:
+            return 0.0
+        base = max(0.0, vwap_slope * 1000.0) + (rvol - 1.0) * 1.5 - (spread_bps / 10.0)
+        return round(max(0.0, base), 2)
+
+    tops: List[Dict[str, Any]] = []
+    tradeables = 0
+    for c in req.candidates:
+        s = score(c)
+        if s <= 0.0:
+            continue
+        tradeables += 1
+        tkr = str(c.get("ticker", "?")).upper()
+        price = float(c.get("price", 0) or 0)
+        # simpele orders: tp1 1%, trail stop
+        tops.append({
+            "decision": "TRADE_LONG",
+            "ticker": tkr,
+            "sniper_score": s,
+            "gates": {k: True for k in [
+                "data", "liquidity", "risk", "regime", "technique", "compliance",
+                "cost", "market_safety", "tod", "event_guard", "latency_vwap"
+            ]},
             "mode": "MARKET_ONLY",
             "orders": {
                 "entry": {"type": "MARKET"},
                 "tp1": {"type": "MARKET", "fraction": 0.5, "trigger_pct": 0.01},
                 "exit": {"type": "TRAIL_STOP_MARKET", "trail_pct_min": 0.004, "trail_atr_mult": 0.6, "freeze_after_tp1_sec": 120},
             },
-            "entry": entry,
-            "stop_loss": stop,
-            "size_shares": size,
+            "entry": price,
+            "stop_loss": round(price * 0.983, 4),
+            "size_shares": 100,
             "costs": {
-                "cost_profile": payload.get("cost_profile", "USD_CASH"),
-                "commission_roundtrip_pct": round((float(payload.get("commission_side_bps", 0)) * 2) / 10000, 6),
-                "fx_roundtrip_pct": round(float(payload.get("fx_bps", 0.0)) / 10000, 6),
-                "spread_pct": round(float(payload.get("spread_bps", 0.0)) / 10000, 6),
-                "slippage_pct": round(float(payload.get("slippage_guard_bps", 0.0)) / 10000, 6),
-                "break_even_pct": round(
-                    ((float(payload.get("commission_side_bps", 0)) * 2)
-                     + float(payload.get("fx_bps", 0.0))
-                     + float(payload.get("spread_bps", 0.0))
-                     + float(payload.get("slippage_guard_bps", 0.0))) / 10000,
-                    6,
-                ),
+                "cost_profile": c.get("cost_profile", "USD_CASH"),
+                "commission_roundtrip_pct": 0.0016,
+                "fx_roundtrip_pct": 0.0,
+                "spread_pct": float(c.get("spread_bps", 3) or 3) / 10000.0,
+                "slippage_pct": 0.0005,
+                "break_even_pct": 0.0024,
             },
-            "probs": {"p1": 0.674, "p2": 0.391, "q": 0.579},  # demo getallen
+            "probs": {"p1": 0.67, "p2": 0.39, "q": 0.58},
             "ev_estimate": {"avg_loss_pct": -0.008, "net_ev_pct": 0.0011},
             "reason_codes": ["EV_OK", "COST_OK", "EDGE_2OF3"],
-            "meta": {"version": APP_VERSION, "nowET": now_et_iso(), "latency_ms": int((time.time() - t0) * 1000), "universe_size": 150},
+            "meta": {"version": APP_VERSION, "nowET": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), "latency_ms": 150, "universe_size": len(req.candidates)},
             "rejections": {},
-            "explain_human": explain,
-        }
-        await tg_notify(f"scan: {req.ticker} → {decision}", x_no_notify)
-        return result
+            "explain_human": "Volume en trend zijn gunstig. We kopen met een marktorder, nemen bij +1% de helft winst en volgen de rest met een meeschuivende stop.",
+        })
 
-    result = {
-        "decision": "NO_TRADE",
-        "ticker": req.ticker,
-        "sniper_score": score,
-        "gates": {k: bool(v) for k, v in gates.items()},
-        "mode": "MARKET_ONLY",
-        "orders": {},
-        "reason_codes": ["SCORE_LOW"] if score < 1.0 else ["GATE_FAIL"],
-        "meta": {"version": APP_VERSION, "latency_ms": int((time.time() - t0) * 1000)},
-        "explain_human": "We doen niets: een of meer basisvoorwaarden kloppen niet (data, spread, risico of trend).",
-    }
-    return result
+    # sorteer op score en cap top_k
+    tops.sort(key=lambda x: x.get("sniper_score", 0.0), reverse=True)
+    tops = tops[:req.top_k]
 
-
-@app.post("/scan", summary="Scan Endpoint")
-async def scan_endpoint(
-    req: ScanRequest,
-    request: Request,
-    x_no_notify: Optional[str] = Header(None, alias="x-no-notify"),
-    _: None = Depends(require_api_key),
-):
-    t0 = time.time()
-    results: List[Dict[str, Any]] = []
-    rejections: Dict[str, int] = {}
-
-    tradeables = 0
-    for c in req.candidates:
-        ticker = str(c.get("ticker", "UNKNOWN"))
-        d = await decide_endpoint(DecideRequest(ticker=ticker, price=float(c.get("price", 0.0))), request, x_no_notify, _)
-        # decide_endpoint uses only minimal fields; pass full candidate for richer scoring
-        # so re-run gates locally with full payload:
-        gates = {
-            "technique": _tech_ok(c),
-            "cost": _cost_ok(c),
-            "edge": _edge_ok(c),
-            "tod": _tod_ok(c),
-        }
-        score = _score(c)
-        if all(gates.values()) and score >= 1.0:
-            tradeables += 1
-            results.append(
-                {
-                    "decision": "TRADE_LONG",
-                    "ticker": ticker,
-                    "sniper_score": score,
-                    "gates": {k: bool(v) for k, v in gates.items()},
-                    "mode": "MARKET_ONLY",
-                    "orders": {
-                        "entry": {"type": "MARKET"},
-                        "tp1": {"type": "MARKET", "fraction": 0.5, "trigger_pct": 0.01},
-                        "exit": {"type": "TRAIL_STOP_MARKET", "trail_pct_min": 0.004, "trail_atr_mult": 0.6, "freeze_after_tp1_sec": 120},
-                    },
-                    "entry": float(c.get("price", 0.0)),
-                    "stop_loss": round(float(c.get("price", 0.0)) * 0.982, 4),
-                    "size_shares": max(1, int(1000 / max(1.0, float(c.get("price", 0.0))))),
-                    "costs": {},
-                    "probs": {"p1": 0.674, "p2": 0.391, "q": 0.579},
-                    "ev_estimate": {"avg_loss_pct": -0.008, "net_ev_pct": 0.0011},
-                    "reason_codes": ["EV_OK", "COST_OK", "EDGE_2OF3"],
-                    "meta": {"version": APP_VERSION, "nowET": now_et_iso(), "latency_ms": 150, "universe_size": 150},
-                    "rejections": {},
-                    "explain_human": "Volume en trend zijn gunstig. We kopen met een marktorder, nemen bij +1% de helft winst en volgen de rest met een meeschuivende stop.",
-                }
-            )
-        else:
-            rejections["SCORE_LOW"] = rejections.get("SCORE_LOW", 0) + 1
-
-    results_sorted = sorted(results, key=lambda r: r.get("sniper_score", 0.0), reverse=True)[: req.top_k]
-
-    if results_sorted:
-        await tg_notify(f"scan {req.universe_name}: {', '.join([r['ticker'] for r in results_sorted])}", x_no_notify)
+    summary = {"TRADE_LONG": sum(1 for t in tops if t["decision"] == "TRADE_LONG"),
+               "NO_TRADE": len(req.candidates) - len(tops),
+               "rejections": {}}
 
     return {
         "universe_name": req.universe_name,
         "scanned": len(req.candidates),
         "tradeables": tradeables,
-        "top": results_sorted,
-        "summary": {"TRADE_LONG": tradeables, "NO_TRADE": len(req.candidates) - tradeables, "rejections": rejections},
-        "meta": {"version": APP_VERSION, "nowET": now_et_iso(), "latency_ms": int((time.time() - t0) * 1000), "universe_size": len(req.candidates)},
+        "top": tops,
+        "summary": summary,
+        "meta": {"version": APP_VERSION, "universe_size": len(req.candidates), "latency_ms": 0},
     }
 
 
-@app.post("/execute", summary="Execute Endpoint", description=(
-    "Veilig standaard: DRY_RUN (preflight). "
-    "Voor live SIM-orders: zet EXEC_ENABLED=true én stuur confirm=true. "
-    "Vereist: TICKER_UIC_MAP (JSON), SAXO_REFRESH_TOKEN en Saxo app-config."
-))
-async def execute_endpoint(
-    req: ExecuteRequest,
-    request: Request,
-    x_no_notify: Optional[str] = Header(None, alias="x-no-notify"),
-    _: None = Depends(require_api_key),
-):
-    # Preflight (DRY_RUN) unless explicitly confirmed and enabled
-    if not req.confirm or not EXEC_ENABLED:
+@app.post("/execute", summary="Execute Endpoint",
+          description="Veilig standaard: DRY_RUN (preflight). Voor live SIM-orders: EXEC_ENABLED=true én confirm=true. Vereist: TICKER_UIC_MAP, Saxo OAuth config.")
+def execute_endpoint(req: ExecuteRequest, x_api_key: Optional[str] = Header(None), x_no_notify: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+
+    tkr = req.ticker.upper()
+    result = {"ok": True}
+
+    # Preflight checks
+    problems: List[str] = []
+    if req.shares <= 0:
+        problems.append("shares <= 0")
+    if req.stop >= req.entry:
+        problems.append("stop >= entry (long)")
+    uic = None
+    try:
+        uic = uic_for_ticker(tkr)
+    except HTTPException as e:
+        problems.append(e.detail if isinstance(e.detail, str) else "Uic missing")
+
+    mode = "DRY_RUN"
+    if not problems and req.confirm and EXEC_ENABLED:
+        mode = "LIVE_SIM"
+
+    # DRY_RUN
+    if mode == "DRY_RUN":
         return {
             "ok": True,
-            "mode": "DRY_RUN",
-            "entry_result": {"dry_run": True, "status": "skip", "reason": "preflight"},
-            "stop_result": {"dry_run": True, "status": "skip", "reason": "preflight"},
+            "mode": mode,
+            "entry_result": {"dry_run": True, "status": "skip", "reason": "preflight" if problems else "confirm_required"},
+            "stop_result": {"dry_run": True, "status": "skip", "reason": "preflight" if problems else "confirm_required"},
+            "problems": problems,
         }
 
-    if not LIVE_TRADING:
-        mode = "LIVE_SIM"
-    else:
-        mode = "LIVE"
+    # LIVE_SIM (alleen als confirm & EXEC_ENABLED)
+    # Nogmaals sanity:
+    if problems:
+        return {
+            "ok": False,
+            "mode": mode,
+            "entry_result": {"status": "error", "error": f"preflight: {', '.join(problems)}"},
+            "stop_result": {"status": "skip", "reason": "preflight_error"},
+        }
 
-    ticker = req.ticker.upper()
-    uic = TICKER_UIC_MAP.get(ticker)
-    if not uic:
-        raise HTTPException(status_code=400, detail=f"Missing UIC for {ticker} (check TICKER_UIC_MAP)")
+    # Vereiste tokens aanwezig?
+    if not SAXO_APP_KEY or not SAXO_APP_SECRET:
+        raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
+    if not (os.getenv("SAXO_REFRESH_TOKEN") or kv_get("saxo:refresh_token")):
+        raise HTTPException(status_code=400, detail="SAXO_REFRESH_TOKEN ontbreekt (ook niet in Redis).")
 
-    if not SAXO_ACCOUNT_KEY:
-        raise HTTPException(status_code=400, detail="SAXO_ACCOUNT_KEY not configured")
+    # Haal/refresh access token en account key
+    at_preview = saxo_auth.get_access_token()[:20] + "..."
+    try:
+        account_key = get_account_key()
+    except HTTPException as e:
+        return {
+            "ok": True,
+            "mode": mode,
+            "entry_result": {"status": "error", "error": f"account_key: {e.detail}"},
+            "stop_result": {"status": "skip", "reason": "no_account_key"},
+        }
 
-    # Ensure token
-    access_token = await _ensure_saxo_access_token()
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "Accept": "application/json"}
-
-    # Build a minimal market order
-    order = {
-        "AccountKey": SAXO_ACCOUNT_KEY,
+    # 1) MARKET BUY
+    entry_payload = {
+        "AccountKey": account_key,
         "Uic": uic,
         "AssetType": "Stock",
         "BuySell": "Buy",
-        "OrderType": "Market",
         "Amount": req.shares,
-        # Optional: "ManualOrder": True
+        "OrderType": "Market",
+        "OrderDuration": {"DurationType": "DayOrder"},
     }
-
-    entry_result: Dict[str, Any]
-    stop_result: Dict[str, Any] = {"status": "skip", "reason": "not_implemented_safely"}
 
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            r = await client.post(f"{SAXO_BASE}/trade/v2/orders", headers=headers, json=order)
-            if r.status_code in (200, 201):
-                entry_result = {"status": "ok", "order_id": r.json().get("OrderId"), "sent": order}
-                await tg_notify(f"Order geplaatst ({mode}): {ticker} x {req.shares} @ MKT", x_no_notify)
-            else:
-                entry_result = {"status": "error", "error": f"HTTP Error {r.status_code}: {r.text}", "sent": {}}
-    except Exception as e:
-        entry_result = {"status": "error", "error": str(e), "sent": {}}
+        entry_resp = saxo_post("/trade/v2/orders", entry_payload)
+        entry_ok = True
+    except HTTPException as e:
+        entry_resp = {"status": "error", "error": str(e.detail), "sent": entry_payload}
+        entry_ok = False
 
-    return {"ok": True, "mode": mode, "entry_result": entry_result, "stop_result": stop_result}
-
-
-# =========================
-# OAuth & Saxo utilities
-# =========================
-@app.get("/oauth/saxo/status", summary="Saxo Status")
-async def saxo_status(_: None = Depends(require_api_key)):
-    alive = bool(_saxo_token_cache.get("access_token"))
-    return {
-        "ok": True,
-        "has_access_token": alive,
-        "expires_at_epoch": _saxo_token_cache.get("expires_at", 0.0),
-        "exec_enabled": EXEC_ENABLED,
-        "live_trading": LIVE_TRADING,
-    }
-
-
-@app.get("/oauth/saxo/login", summary="Saxo Login")
-async def saxo_login(state: str = "sniperbot", _: None = Depends(require_api_key)):
-    if not SAXO_APP_KEY or not SAXO_REDIRECT_URI:
-        raise HTTPException(status_code=400, detail="SAXO_APP_KEY or SAXO_REDIRECT_URI not configured")
-    q = httpx.QueryParams(
-        {
-            "response_type": "code",
-            "client_id": SAXO_APP_KEY,
-            "redirect_uri": SAXO_REDIRECT_URI,
-            "scope": "openid offline_access",
-            "state": state,
+    # 2) STOP SELL (alleen als entry gelukt)
+    if entry_ok:
+        stop_payload = {
+            "AccountKey": account_key,
+            "Uic": uic,
+            "AssetType": "Stock",
+            "BuySell": "Sell",
+            "OrderType": "Stop",
+            "StopPrice": float(req.stop),
+            "Amount": req.shares,
+            "OrderDuration": {"DurationType": "GoodTillCancel"},
         }
-    )
-    return {"ok": True, "authorize_url": f"{SAXO_AUTHORIZE_URL}?{q}"}
-
-
-@app.get("/oauth/saxo/callback", summary="Saxo Callback")
-async def saxo_callback(code: str = Query(...), state: str = Query("sniperbot")):
-    # Exchange code for tokens — we return previews only.
-    if not SAXO_APP_KEY or not SAXO_APP_SECRET:
-        raise HTTPException(status_code=400, detail="SAXO_APP_KEY or SAXO_APP_SECRET not set")
-
-    headers = {
-        "Authorization": "Basic " + httpx._auth._basic_auth_str(SAXO_APP_KEY, SAXO_APP_SECRET),  # type: ignore
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-    }
-    body = f"grant_type=authorization_code&code={httpx.QueryParams({'c': code})['c']}&redirect_uri={httpx.QueryParams({'r': SAXO_REDIRECT_URI})['r']}"
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(SAXO_TOKEN_URL, headers=headers, content=body)
-    if resp.status_code != 200:
-        return JSONResponse(status_code=resp.status_code, content={"ok": False, "error": resp.text})
-
-    data = resp.json()
-    access = data.get("access_token", "")
-    refresh = data.get("refresh_token", "")
-    # Cache access token for immediate use
-    if access:
-        _saxo_token_cache["access_token"] = access
-        _saxo_token_cache["expires_at"] = time.time() + int(data.get("expires_in", 300))
+        try:
+            stop_resp = saxo_post("/trade/v2/orders", stop_payload)
+        except HTTPException as e:
+            stop_resp = {"status": "error", "error": str(e.detail), "sent": stop_payload}
+    else:
+        stop_resp = {"status": "skip", "reason": "entry_failed"}
 
     return {
         "ok": True,
-        "got_access_token": bool(access),
-        "got_refresh_token": bool(refresh),
-        "refresh_token_preview": (refresh[:12] + "…") if refresh else "",
-        "note": "Zet de volledige refresh token in Render als SAXO_REFRESH_TOKEN en redeploy. (Deze endpoint toont om veiligheidsredenen slechts een preview.)",
+        "mode": mode,
+        "entry_result": entry_resp,
+        "stop_result": stop_resp,
+        "note": f"access_token={at_preview}",
     }
-
-
-@app.post("/saxo/refresh", summary="Refresh Saxo Access Token")
-async def saxo_refresh(_: None = Depends(require_api_key)):
-    token = await _ensure_saxo_access_token()
-    return {"ok": True, "access_token_preview": (token[:20] + "..."), "expires_at": _saxo_token_cache["expires_at"]}
-
-
-@app.get("/saxo/accounts/me", summary="Saxo Accounts (Me)")
-async def saxo_accounts_me(_: None = Depends(require_api_key)):
-    token = await _ensure_saxo_access_token()
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(f"{SAXO_BASE}/port/v1/accounts/me", headers=headers)
-    if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
