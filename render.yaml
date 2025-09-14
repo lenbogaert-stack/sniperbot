@@ -6,7 +6,13 @@ services:
     autoDeploy: true
     healthCheckPath: /healthz
     dockerfilePath: ./Dockerfile
+    disk:
+      name: saxo-tokens
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
+      - key: SAXO_TOKEN_PATH
+        value: /var/data/saxo_tokens.json
       - key: EXEC_MODE
         value: MARKET_ONLY
       - key: LIVE_TRADING

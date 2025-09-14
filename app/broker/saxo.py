@@ -1,18 +1,18 @@
 import os, json, httpx
-from typing import Optional
+from typing import Optional, Callable, Awaitable
 
 class SaxoClient:
     """
     Minimale Saxo OpenAPI adapter.
     - Default: DRY RUN (SAXO_ENABLED=false) -> alleen loggen, niets sturen.
-    - LIVE HTTP: zet SAXO_ENABLED=true, vul env (token, account, base_url).
+    - LIVE HTTP: zet SAXO_ENABLED=true, vul bearer via get_bearer callback.
     - UIC Mapping: via env TICKER_UIC_MAP='{"AAPL":265598,"MSFT":1904}' (voorbeeld).
     """
 
-    def __init__(self):
+    def __init__(self, get_bearer: Optional[Callable[[], Awaitable[str]]] = None):
         self.enabled = os.getenv("SAXO_ENABLED", "false").lower() == "true"
         self.base_url = os.getenv("SAXO_BASE_URL", "").rstrip("/")
-        self.access_token = os.getenv("SAXO_ACCESS_TOKEN", "")
+        self.get_bearer = get_bearer
         self.account_key = os.getenv("SAXO_ACCOUNT_KEY", "")
         # eenvoudige symbol→UIC mapping om zonder extra API-calls te werken
         try:
@@ -24,9 +24,12 @@ class SaxoClient:
         self.market_limit_bps = float(os.getenv("SAXO_MARKETABLE_LIMIT_BPS", "0"))  # 0 = uit
 
     # ---------- helpers ----------
-    def _headers(self):
+    async def _headers(self):
+        if not self.get_bearer:
+            raise RuntimeError("No bearer token provider configured")
+        bearer_token = await self.get_bearer()
         return {
-            "Authorization": f"Bearer {self.access_token}",
+            "Authorization": f"Bearer {bearer_token}",
             "Content-Type": "application/json",
         }
 
@@ -36,13 +39,12 @@ class SaxoClient:
     def _ensure_live_ready(self):
         if not self.enabled:
             raise RuntimeError("SAXO_ENABLED=false (dry-run)")
-        for k, v in {
-            "SAXO_BASE_URL": self.base_url,
-            "SAXO_ACCESS_TOKEN": self.access_token,
-            "SAXO_ACCOUNT_KEY": self.account_key,
-        }.items():
-            if not v:
-                raise RuntimeError(f"Missing env: {k}")
+        if not self.base_url:
+            raise RuntimeError("Missing env: SAXO_BASE_URL")
+        if not self.get_bearer:
+            raise RuntimeError("Missing bearer token provider")
+        if not self.account_key:
+            raise RuntimeError("Missing env: SAXO_ACCOUNT_KEY")
 
     # ---------- public API ----------
     async def place_market_buy(self, ticker: str, shares: int, last_price: float) -> dict:
@@ -88,7 +90,8 @@ class SaxoClient:
         orders_url = os.getenv("SAXO_ORDERS_ENDPOINT", f"{self.base_url}/trade/v2/orders")
 
         async with httpx.AsyncClient(timeout=5.0) as cli:
-            r = await cli.post(orders_url, headers=self._headers(), json=order)
+            headers = await self._headers()
+            r = await cli.post(orders_url, headers=headers, json=order)
             try:
                 data = r.json()
             except Exception:
@@ -130,7 +133,8 @@ class SaxoClient:
         }
         orders_url = os.getenv("SAXO_ORDERS_ENDPOINT", f"{self.base_url}/trade/v2/orders")
         async with httpx.AsyncClient(timeout=5.0) as cli:
-            r = await cli.post(orders_url, headers=self._headers(), json=order)
+            headers = await self._headers()
+            r = await cli.post(orders_url, headers=headers, json=order)
             try:
                 data = r.json()
             except Exception:
