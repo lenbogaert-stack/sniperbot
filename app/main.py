@@ -2,7 +2,7 @@
 # SNIPERBOT API v3.2 – FastAPI + Saxo auto-refresh (SIM), met simpele scan/execute.
 #
 # Vereiste ENV variabelen (Render e.d.):
-# - SINGLE_API_KEY=lenbogy123                 # of eigen API key; header: X-API-Key
+# - API-key is hardcoded als "lenbogy123" in header: X-API-Key
 # - EXEC_ENABLED=true                         # verplicht voor live SIM orders
 # - LIVE_TRADING=true                         # puur label; SIM blijft SIM (SAXO_BASE = /sim/)
 # - SAXO_BASE=https://gateway.saxobank.com/sim/openapi
@@ -53,7 +53,7 @@ app = FastAPI(title="SNIPERBOT API", version=APP_VERSION)
 
 # ======= Config uit ENV =======
 
-SINGLE_API_KEY = os.getenv("SINGLE_API_KEY", "lenbogy123")
+SINGLE_API_KEY = "lenbogy123"
 
 SAXO_BASE       = os.getenv("SAXO_BASE", "https://gateway.saxobank.com/sim/openapi")
 SAXO_TOKEN_URL  = os.getenv("SAXO_TOKEN_URL", "https://sim.logonvalidation.net/token")
