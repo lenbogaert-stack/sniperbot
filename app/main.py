@@ -1,6 +1,13 @@
 # main.py
 # SNIPERBOT API v3.2 – FastAPI + Saxo auto-refresh (SIM), met simpele scan/execute.
 #
+# REFACTORED: Now uses TokenManager for runtime bearer tokens instead of static env tokens.
+# SaxoClient gets fresh bearer tokens via async callback from persistent TokenManager.
+# 
+# NEW DIAGNOSTIC ENDPOINTS:
+# - GET  /saxo/token/status   # TokenManager.status() -> real-time token info
+# - POST /saxo/token/refresh  # Force refresh and return result
+#
 # Vereiste ENV variabelen (Render e.d.):
 # - SINGLE_API_KEY=lenbogy123                 # of eigen API key; header: X-API-Key
 # - EXEC_ENABLED=true                         # verplicht voor live SIM orders
@@ -9,8 +16,9 @@
 # - SAXO_TOKEN_URL=https://sim.logonvalidation.net/token
 # - SAXO_APP_KEY=<je SIM app key>
 # - SAXO_APP_SECRET=<je SIM app secret>
-# - SAXO_REFRESH_TOKEN=<initiële refresh token>   # wordt daarna geroteerd (indien Redis)
+# - SAXO_REFRESH_TOKEN=<initiële refresh token>   # wordt daarna geroteerd op disk
 # - SAXO_ACCOUNT_KEY=<accountKey zoals ytESP3...> # optioneel; anders auto-ophalen
+# - SAXO_TOKEN_PATH=/var/data/saxo_tokens.json    # disk persistence path (default)
 # - TICKER_UIC_MAP={"AAPL":211,"MSFT":261,...}    # JSON string
 # - REDIS_URL=rediss://:<pwd>@<host>:<port>/0     # optioneel maar aangeraden
 # - SAXO_REDIRECT_URI=https://oauth.pstmn.io/v1/callback   # optioneel (voor /oauth flow)
@@ -20,13 +28,17 @@
 # - POST /decide        {ticker, price}
 # - POST /scan          {universe_name, top_k=3, candidates:[...]}
 # - POST /execute       {ticker, shares, entry, stop, confirm=false}
-# - GET  /oauth/saxo/status
-# - POST /saxo/refresh  (force refresh)
+# - GET  /saxo/token/status     (NEW: TokenManager status)
+# - POST /saxo/token/refresh    (NEW: Force token refresh)
+# - GET  /oauth/saxo/status     (LEGACY: backwards compatibility)
+# - POST /saxo/refresh          (LEGACY: backwards compatibility)
 #
 # Opmerking:
 # - /execute plaatst 2 orders bij Saxo (MARKET Buy, daarna Stop Sell) ALS confirm=true & EXEC_ENABLED=true
 # - Anders DRY_RUN met preflight-uitkomst.
-# - Alle Saxo-calls gebruiken auto-refresh met 401 retry en refresh-token-rotatie.
+# - Alle Saxo-calls gebruiken auto-refresh met fresh bearer tokens via TokenManager.
+# - TokenManager start bij app-startup; tokens op disk (/var/data/saxo_tokens.json).
+# - Graceful fallback: geen TokenManager → development mode (geen Saxo API calls).
 
 import os
 import json
