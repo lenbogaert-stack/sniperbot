@@ -9,11 +9,16 @@
 # - SAXO_TOKEN_URL=https://sim.logonvalidation.net/token
 # - SAXO_APP_KEY=<je SIM app key>
 # - SAXO_APP_SECRET=<je SIM app secret>
-# - SAXO_REFRESH_TOKEN=<initiële refresh token>   # wordt daarna geroteerd (indien Redis)
+# - SAXO_REFRESH_TOKEN=<initiële refresh token>   # wordt daarna geroteerd en opgeslagen op disk
 # - SAXO_ACCOUNT_KEY=<accountKey zoals ytESP3...> # optioneel; anders auto-ophalen
 # - TICKER_UIC_MAP={"AAPL":211,"MSFT":261,...}    # JSON string
-# - REDIS_URL=rediss://:<pwd>@<host>:<port>/0     # optioneel maar aangeraden
+# - REDIS_URL=rediss://:<pwd>@<host>:<port>/0     # DEPRECATED - nu disk-based token storage
 # - SAXO_REDIRECT_URI=https://oauth.pstmn.io/v1/callback   # optioneel (voor /oauth flow)
+#
+# Token Management:
+# - Gebruikt async SaxoTokenManager met disk-gebaseerde opslag in /var/data/saxo_tokens.json
+# - Automatische token refresh met rotatie support
+# - Debug logging voor alle token operaties
 #
 # Endpoints:
 # - GET  /healthz
@@ -87,7 +92,7 @@ except Exception as e:
     log.warning("Kon TICKER_UIC_MAP niet parsen: %s", e)
     TICKER_UIC_MAP = {}
 
-REDIS_URL = os.getenv("REDIS_URL", "")
+
 
 
 # ======= Security (API Key) =======
