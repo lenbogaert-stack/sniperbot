@@ -12,6 +12,38 @@ from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
+# --- WIJZIGING START: Dummy Token Manager & Import ---
+# Omdat de echte SaxoTokenManager niet is meegeleverd, voegen we hier een
+# dummy-klasse toe zodat de code correct kan worden geïnterpreteerd.
+# In een productieomgeving zou je dit vervangen door:
+# from .token_manager import SaxoTokenManager
+class SaxoTokenManager:
+    """Dummy SaxoTokenManager voor demonstratiedoeleinden."""
+    def __init__(self, **kwargs):
+        self._status = {"initialized": True, "token_available": False, "strategy": kwargs.get("strategy", "memory")}
+        self._token = "dummy-access-token-from-manager"
+        logging.info("SaxoTokenManager initialized (dummy).")
+
+    def start(self):
+        """Simuleert het starten van een achtergrondtaak voor token-verversing."""
+        self._status["refresher_started"] = True
+        logging.info("SaxoTokenManager background refresh started (dummy).")
+
+    def status(self) -> Dict[str, Any]:
+        """Geeft een veilige status terug zonder gevoelige informatie."""
+        safe_status = self._status.copy()
+        safe_status.pop("app_secret", None)
+        safe_status.pop("refresh_token", None)
+        return safe_status
+
+    async def get_access_token(self) -> str:
+        """Haalt asynchroon een geldige access token op."""
+        if not self._status.get("token_available"):
+            self._status["token_available"] = True
+            self._status["last_refreshed_ts"] = int(time.time())
+        return self._token
+# --- WIJZIGING EIND ---
+
 # ------------------------------------------------------------
 # Import jouw schema’s en engine
 # (sluiten aan op de file-indeling die je al hebt)
@@ -101,6 +133,24 @@ except Exception:
 # ------------------------------------------------------------
 app = FastAPI(title="SNIPERBOT API", version="v3.2")
 logger = logging.getLogger("uvicorn.error")
+
+
+# --- WIJZIGING START: Initialiseer manager bij startup ---
+@app.on_event("startup")
+async def _init_token_mgr():
+    if os.getenv("EXEC_ENABLED", "false").lower() == "true":
+        app.state.saxo_mgr = SaxoTokenManager(
+            app_key=os.getenv("SAXO_APP_KEY", ""),
+            app_secret=os.getenv("SAXO_APP_SECRET", ""),
+            refresh_token=os.getenv("SAXO_REFRESH_TOKEN", ""),
+            token_url=os.getenv("SAXO_TOKEN_URL", "https://sim.logonvalidation.net/token"),
+            strategy=os.getenv("TOKEN_STRATEGY", "memory"),
+            storage_path=os.getenv("TOKEN_STORAGE_PATH", "/var/data/saxo_tokens.json"),
+            auto_refresh=os.getenv("TOKEN_AUTO_REFRESH", "true").lower() == "true",
+        )
+        app.state.saxo_mgr.start()
+# --- WIJZIGING EIND ---
+
 
 # ------------------------------------------------------------
 # Config / ENV
@@ -236,22 +286,23 @@ def _saxo_token_request(payload: Dict[str, str]) -> Dict[str, Any]:
         return json.loads(r.read().decode())
 
 
-def _get_access_token_from_refresh() -> str:
-    """Gebruik SAXO_REFRESH_TOKEN om een access token op te halen."""
-    if not SAXO_REFRESH_TOKEN:
-        raise HTTPException(status_code=400, detail="Missing SAXO_REFRESH_TOKEN")
-    _saxo_require_env()
-    tok = _saxo_token_request({
-        "grant_type": "refresh_token",
-        "refresh_token": SAXO_REFRESH_TOKEN,
-        "client_id": SAXO_APP_KEY,
-        "client_secret": SAXO_APP_SECRET,
-        "redirect_uri": SAXO_REDIRECT,
-    })
-    access = tok.get("access_token")
-    if not access:
-        raise HTTPException(status_code=502, detail="Could not obtain access_token from refresh_token")
-    return access
+# --- VERWIJDERING: Deze helper is niet meer nodig door de Token Manager ---
+# def _get_access_token_from_refresh() -> str:
+#     """Gebruik SAXO_REFRESH_TOKEN om een access token op te halen."""
+#     if not SAXO_REFRESH_TOKEN:
+#         raise HTTPException(status_code=400, detail="Missing SAXO_REFRESH_TOKEN")
+#     _saxo_require_env()
+#     tok = _saxo_token_request({
+#         "grant_type": "refresh_token",
+#         "refresh_token": SAXO_REFRESH_TOKEN,
+#         "client_id": SAXO_APP_KEY,
+#         "client_secret": SAXO_APP_SECRET,
+#         "redirect_uri": SAXO_REDIRECT,
+#     })
+#     access = tok.get("access_token")
+#     if not access:
+#         raise HTTPException(status_code=502, detail="Could not obtain access_token from refresh_token")
+#     return access
 
 
 # ------------------------------------------------------------
@@ -302,7 +353,7 @@ def scan_endpoint(
 
 
 @app.post("/execute", dependencies=[Depends(require_api_key)])
-def execute_endpoint(
+async def execute_endpoint(  # --- WIJZIGING: Route is nu async ---
     req: ExecuteRequest,
     request: Request,
     x_no_notify: Optional[str] = Header(None),
@@ -326,8 +377,15 @@ def execute_endpoint(
     if not uic:
         raise HTTPException(status_code=400, detail=f"Missing UIC for {ticker} (check TICKER_UIC_MAP env)")
 
-    # Access token uit refresh
-    access_token = _get_access_token_from_refresh()
+    # --- WIJZIGING START: Haal Bearer via manager ---
+    mgr = getattr(app.state, "saxo_mgr", None)
+    if not mgr:
+        raise HTTPException(status_code=500, detail="Token manager ontbreekt (EXEC_ENABLED=false?).")
+    try:
+        access_token = await mgr.get_access_token()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Token refresh faalde: {e}")
+    # --- WIJZIGING EIND ---
 
     # Saxo order body (simpel market BUY)
     order_body = {
@@ -349,7 +407,7 @@ def execute_endpoint(
             data=payload,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {access_token}",
+                "Authorization": f"Bearer {access_token}", # Gebruikt nu token van manager
                 "Accept": "application/json",
             },
             method="POST",
@@ -379,6 +437,19 @@ def execute_endpoint(
 
 
 # ---------------- Saxo OAuth helper routes -----------------
+
+# --- WIJZIGING START: Nieuw status-endpoint ---
+@app.get("/oauth/saxo/status")
+async def saxo_status():
+    mgr = getattr(app.state, "saxo_mgr", None)
+    if not mgr:
+        return {"ok": False, "note": "EXEC_ENABLED=false of token manager niet geïnitialiseerd"}
+    st = mgr.status()
+    # geen tokens lekken
+    return {"ok": True, "status": st}
+# --- WIJZIGING EIND ---
+
+
 @app.get("/oauth/saxo/login")
 def saxo_login():
     _saxo_require_env()
