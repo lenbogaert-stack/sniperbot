@@ -36,8 +36,10 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import requests
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from pydantic import BaseModel, Field, validator
+
+from .token_manager import SaxoTokenManager
 
 # Redis is optioneel
 try:
@@ -50,6 +52,37 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sniperbot")
 
 app = FastAPI(title="SNIPERBOT API", version=APP_VERSION)
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize TokenManager and trigger initial refresh"""
+    global tm
+    
+    # Only initialize if we have the required credentials
+    if SAXO_APP_KEY and SAXO_APP_SECRET:
+        # Get refresh token from env or Redis
+        initial_refresh_token = kv_get("saxo:refresh_token") or os.getenv("SAXO_REFRESH_TOKEN", "")
+        
+        if initial_refresh_token:
+            tm = SaxoTokenManager(
+                app_key=SAXO_APP_KEY,
+                app_secret=SAXO_APP_SECRET,
+                refresh_token=initial_refresh_token,
+                token_url=SAXO_TOKEN_URL,
+                strategy="memory",  # Use memory strategy since we have Redis for persistence
+                auto_refresh=True
+            )
+            
+            try:
+                # Trigger initial refresh
+                await tm.refresh_access_token()
+                log.info("TokenManager initialized and initial refresh completed")
+            except Exception as e:
+                log.warning(f"Failed to do initial token refresh: {e}")
+        else:
+            log.warning("No refresh token available for TokenManager initialization")
+    else:
+        log.warning("SAXO_APP_KEY or SAXO_APP_SECRET missing, TokenManager not initialized")
 
 # ======= Config uit ENV =======
 
@@ -230,6 +263,15 @@ class SaxoAuthManager:
 
 saxo_auth = SaxoAuthManager()
 
+# ======= Global TokenManager for new endpoints =======
+tm: Optional[SaxoTokenManager] = None
+
+def _require_mgr() -> SaxoTokenManager:
+    """Helper to get the global token manager, ensuring it's initialized."""
+    if tm is None:
+        raise HTTPException(status_code=503, detail="TokenManager not initialized")
+    return tm
+
 
 # ======= Saxo helpers =======
 
@@ -292,6 +334,54 @@ def uic_for_ticker(ticker: str) -> int:
     if t not in TICKER_UIC_MAP:
         raise HTTPException(status_code=400, detail=f"Ticker '{t}' niet gevonden in TICKER_UIC_MAP.")
     return int(TICKER_UIC_MAP[t])
+
+
+@app.post("/oauth/saxo/refresh", summary="Force Saxo TokenManager refresh")
+async def oauth_saxo_refresh(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    require_api_key(x_api_key)
+    manager = _require_mgr()
+    
+    try:
+        bundle = await manager.refresh_access_token()
+        return {
+            "ok": True,
+            "access_token_preview": (bundle.access_token[:20] + "...") if bundle.access_token else None,
+            "expires_at_epoch": bundle.expires_at,
+            "last_refresh_ts": bundle.last_refresh_ts,
+            "seconds_left": bundle.seconds_left
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
+
+
+@app.get("/saxo/token/status", summary="Saxo TokenManager status (alias)")
+async def saxo_token_status(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    require_api_key(x_api_key)
+    manager = _require_mgr()
+    
+    status = manager.status()
+    return {
+        "ok": True,
+        **status
+    }
+
+
+@app.post("/saxo/token/refresh", summary="Force Saxo TokenManager refresh (alias)")
+async def saxo_token_refresh(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    require_api_key(x_api_key)
+    manager = _require_mgr()
+    
+    try:
+        bundle = await manager.refresh_access_token()
+        return {
+            "ok": True,
+            "access_token_preview": (bundle.access_token[:20] + "...") if bundle.access_token else None,
+            "expires_at_epoch": bundle.expires_at,
+            "last_refresh_ts": bundle.last_refresh_ts,
+            "seconds_left": bundle.seconds_left
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
 
 
 # ======= Endpoints =======
