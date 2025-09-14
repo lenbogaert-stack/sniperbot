@@ -313,16 +313,27 @@ def saxo_status(x_api_key: Optional[str] = Header(None)):
     }
 
 
+def _get_mgr():
+    """Helper function to get the token manager. Defaults to saxo_auth (current manager)."""
+    return saxo_auth
+
+
 @app.post("/saxo/refresh", summary="Forceer Saxo token refresh")
 def saxo_refresh(x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
-    # Force refresh; duidelijke fouten i.p.v. 500
-    if not SAXO_APP_KEY or not SAXO_APP_SECRET:
-        raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
-    if not (os.getenv("SAXO_REFRESH_TOKEN") or kv_get("saxo:refresh_token")):
-        raise HTTPException(status_code=400, detail="Ontbrekende refresh token (SAXO_REFRESH_TOKEN/Redis).")
-    at = saxo_auth.get_access_token(force=True)
-    return {"ok": True, "access_token_preview": (at[:20] + "..."), "expires_at_epoch": saxo_auth.expires_at}
+    try:
+        # Force refresh; duidelijke fouten i.p.v. 500
+        if not SAXO_APP_KEY or not SAXO_APP_SECRET:
+            return {"ok": False, "error": "SAXO_APP_KEY/SECRET ontbreken.", "error_code": "missing_credentials"}
+        if not (os.getenv("SAXO_REFRESH_TOKEN") or kv_get("saxo:refresh_token")):
+            return {"ok": False, "error": "Ontbrekende refresh token (SAXO_REFRESH_TOKEN/Redis).", "error_code": "missing_refresh_token"}
+        
+        mgr = _get_mgr()
+        at = mgr.get_access_token(force=True)
+        return {"ok": True, "access_token_preview": (at[:20] + "..."), "expires_at_epoch": mgr.expires_at}
+    except Exception as e:
+        # Fail-safe: never 502, always JSON response
+        return {"ok": False, "error": str(e), "error_code": "refresh_failed"}
 
 
 @app.post("/decide", summary="Decide Endpoint")
