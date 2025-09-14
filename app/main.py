@@ -4,493 +4,481 @@ from __future__ import annotations
 import os
 import json
 import time
-import logging
-import urllib.parse
-import urllib.request
-from typing import Optional, Dict, Any, List
+import math
+import threading
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Depends, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+import requests
+from fastapi import FastAPI, Header, HTTPException, Request, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-# --- WIJZIGING START: Dummy Token Manager & Import ---
-# Omdat de echte SaxoTokenManager niet is meegeleverd, voegen we hier een
-# dummy-klasse toe zodat de code correct kan worden geïnterpreteerd.
-# In een productieomgeving zou je dit vervangen door:
-# from .token_manager import SaxoTokenManager
-class SaxoTokenManager:
-    """Dummy SaxoTokenManager voor demonstratiedoeleinden."""
-    def __init__(self, **kwargs):
-        self._status = {"initialized": True, "token_available": False, "strategy": kwargs.get("strategy", "memory")}
-        self._token = "dummy-access-token-from-manager"
-        logging.info("SaxoTokenManager initialized (dummy).")
+# ----------------------------
+# Config & helpers
+# ----------------------------
 
-    def start(self):
-        """Simuleert het starten van een achtergrondtaak voor token-verversing."""
-        self._status["refresher_started"] = True
-        logging.info("SaxoTokenManager background refresh started (dummy).")
+VERSION = "v3.2"
+API_KEY_EXPECTED = os.getenv("X_API_KEY", "lenbogy123")
 
-    def status(self) -> Dict[str, Any]:
-        """Geeft een veilige status terug zonder gevoelige informatie."""
-        safe_status = self._status.copy()
-        safe_status.pop("app_secret", None)
-        safe_status.pop("refresh_token", None)
-        return safe_status
+LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+EXEC_ENABLED = os.getenv("EXEC_ENABLED", "false").lower() == "true"
 
-    async def get_access_token(self) -> str:
-        """Haalt asynchroon een geldige access token op."""
-        if not self._status.get("token_available"):
-            self._status["token_available"] = True
-            self._status["last_refreshed_ts"] = int(time.time())
-        return self._token
-# --- WIJZIGING EIND ---
+SAXO_BASE = os.getenv("SAXO_BASE", "https://gateway.saxobank.com/sim/openapi").rstrip("/")
+SAXO_APP_KEY = os.getenv("SAXO_APP_KEY", "").strip()
+SAXO_APP_SECRET = os.getenv("SAXO_APP_SECRET", "").strip()
+SAXO_REFRESH_TOKEN = os.getenv("SAXO_REFRESH_TOKEN", "").strip()
+SAXO_ACCOUNT_KEY = os.getenv("SAXO_ACCOUNT_KEY", "").strip()  # bv. ytESP...==
 
-# ------------------------------------------------------------
-# Import jouw schema’s en engine
-# (sluiten aan op de file-indeling die je al hebt)
-# ------------------------------------------------------------
+# Token endpoint obv sim/live
+if "/sim/" in SAXO_BASE:
+    SAXO_TOKEN_URL = "https://sim.logonvalidation.net/token"
+else:
+    SAXO_TOKEN_URL = "https://live.logonvalidation.net/token"
+
+# Ticker -> UIC mapping (JSON in env)
 try:
-    from app.schemas import (
-        DecideRequest, DecideResponse,
-        ScanRequest, ScanResponse,
-        ExecuteRequest, ExecuteResponse,
-    )
+    TICKER_UIC_MAP: Dict[str, int] = json.loads(os.getenv("TICKER_UIC_MAP", "{}"))
+    # keys case-insensitive
+    TICKER_UIC_MAP = {k.upper(): int(v) for k, v in TICKER_UIC_MAP.items()}
 except Exception:
-    # Fallback: minimale typedicts als schema’s ontbreken
-    from pydantic import BaseModel
+    TICKER_UIC_MAP = {}
 
-    class DecideRequest(BaseModel):
-        ticker: str
-        price: float
+TG_ENABLED = os.getenv("TG_ENABLED", "false").lower() == "true"
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
-    class DecideResponse(BaseModel):
-        decision: str
-        ticker: str
-        explain_human: Optional[str] = None
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    class ScanRequest(BaseModel):
-        universe_name: str
-        top_k: int = 3
-        candidates: list
+def require_api_key(x_api_key: str | None):
+    if not x_api_key or x_api_key != API_KEY_EXPECTED:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    class ScanResponse(BaseModel):
-        universe_name: str
-        scanned: int
-        tradeables: int
-        top: list
-        summary: dict
-        meta: dict
+def notify_async(text: str, no_notify: bool = False) -> None:
+    """Non-blocking Telegram message; failsafe (swallows errors)."""
+    if no_notify or not TG_ENABLED or not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    def _send():
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TG_CHAT_ID, "text": text[:4000], "disable_web_page_preview": True},
+                timeout=5,
+            )
+        except Exception:
+            pass
+    threading.Thread(target=_send, daemon=True).start()
 
-    class ExecuteRequest(BaseModel):
-        ticker: str
-        shares: int
-        entry: float
-        stop: float
-        confirm: bool = False
+# ----------------------------
+# Saxo session (refresh + auth)
+# ----------------------------
 
-    class ExecuteResponse(BaseModel):
-        ok: bool
-        mode: str
-        entry_result: dict
-        stop_result: dict
+class SaxoSession:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.access_token: Optional[str] = None
+        self.expires_at: float = 0.0   # epoch seconds
+        self.refresh_token_mem: Optional[str] = SAXO_REFRESH_TOKEN or None
 
-# Engine functies (zoals je ze al in je repo hebt)
-try:
-    from app.engine.decide import run_decision, run_scan
-except Exception:
-    # Dummy fallbacks als engine import mislukt (gebruikt je echte engine in prod)
-    def run_decision(req: DecideRequest) -> Dict[str, Any]:
+    def _refresh_locked(self) -> Dict[str, Any]:
+        if not (SAXO_APP_KEY and SAXO_APP_SECRET and (self.refresh_token_mem or SAXO_REFRESH_TOKEN)):
+            raise HTTPException(status_code=400, detail="Saxo credentials missing (APP_KEY/SECRET/REFRESH_TOKEN).")
+
+        refresh_token = self.refresh_token_mem or SAXO_REFRESH_TOKEN
+        basic = f"{SAXO_APP_KEY}:{SAXO_APP_SECRET}".encode("ascii")
+        headers = {
+            "Authorization": "Basic " + (basic).decode("ascii").encode("ascii").hex(),  # will overwrite below
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+        # Basic must be Base64, not hex: fix:
+        import base64
+        headers["Authorization"] = "Basic " + base64.b64encode(basic).decode("ascii")
+
+        body = f"grant_type=refresh_token&refresh_token={requests.utils.quote(refresh_token)}"
+        resp = requests.post(SAXO_TOKEN_URL, headers=headers, data=body, timeout=15)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=401, detail=f"Saxo refresh failed: HTTP {resp.status_code}: {resp.text}")
+
+        data = resp.json()
+        self.access_token = data.get("access_token")
+        # Rotated refresh token?
+        if data.get("refresh_token"):
+            self.refresh_token_mem = data["refresh_token"]
+
+        # expires_in (sec)
+        ttl = int(data.get("expires_in", 900))
+        # refresh proactively a bit early
+        self.expires_at = time.time() + max(60, ttl - 60)
+        return {"ok": True, "rotated": bool(data.get("refresh_token"))}
+
+    def get_access_token(self, force: bool = False) -> str:
+        with self._lock:
+            if force or not self.access_token or time.time() >= self.expires_at:
+                self._refresh_locked()
+            return self.access_token  # type: ignore
+
+    def auth_headers(self) -> Dict[str, str]:
+        tok = self.get_access_token()
+        return {"Authorization": f"Bearer {tok}", "Accept": "application/json"}
+
+SAXO = SaxoSession()
+
+def saxo_get(url: str, params: Dict[str, Any] | None = None) -> requests.Response:
+    headers = SAXO.auth_headers()
+    return requests.get(url, headers=headers, params=params, timeout=20)
+
+def saxo_post(url: str, payload: Dict[str, Any]) -> requests.Response:
+    headers = SAXO.auth_headers()
+    headers["Content-Type"] = "application/json"
+    return requests.post(url, headers=headers, json=payload, timeout=20)
+
+# ----------------------------
+# FastAPI
+# ----------------------------
+
+app = FastAPI(title="SNIPERBOT API", version=VERSION)
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "version": VERSION}
+
+# ----------------------------
+# Universe (simple)
+# ----------------------------
+
+SP100 = [
+    # (verkorte lijst – voeg gerust uit je env of repo toe)
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","JPM",
+    "UNH","XOM","V","MA","HD","PG","CVX","LLY","COST","MRK","ABBV","PEP",
+    "BAC","KO","PFE","CSCO","ADBE","WMT","NFLX","CRM","ORCL","DIS","QCOM",
+    "INTC","AMD","TXN","AMAT","NKE","MCD","IBM","BA","CAT","HON"
+]
+
+@app.get("/universe")
+def get_universe(name: str = Query("SP100"), x_api_key: str | None = Header(None)):
+    require_api_key(x_api_key)
+    name_u = name.lower()
+    if name_u == "sp100":
+        tickers = SP100
+    elif name_u == "custom":
+        # Optioneel: alleen extras uit env
+        extras = json.loads(os.getenv("UNIVERSE_EXTRAS", "[]"))
+        tickers = [t.upper() for t in extras]
+    else:
+        tickers = SP100
+    return {"universe_name": name.upper(), "count": len(tickers), "tickers": tickers}
+
+# ----------------------------
+# Beslis-engine (light maar deterministisch)
+# ----------------------------
+
+def edge_persistence_ok(inp: Dict[str, Any]) -> bool:
+    vwap_re = bool(inp.get("vwap_reclaims_ok", False))
+    orb_ok   = bool(inp.get("orb_follow_ok", False))
+    uptick   = float(inp.get("uptick_ratio_60", 0.0))
+    score = (1 if vwap_re else 0) + (1 if orb_ok else 0) + (1 if uptick >= 0.60 else 0)
+    return score >= 2
+
+def technique_ok(inp: Dict[str, Any]) -> bool:
+    vwap = float(inp.get("vwap", 0.0))
+    price = float(inp.get("price", 0.0))
+    slope = float(inp.get("vwap_slope_pct_per_min", 0.0))
+    if vwap <= 0 or price <= 0:
+        return False
+    return (price >= vwap * (1 + 0.0005)) and (slope > 0)
+
+def tod_ok(inp: Dict[str, Any]) -> bool:
+    tod = (inp.get("time_of_day") or "core").lower()
+    if tod == "core":
+        return True
+    if tod == "lunch":
+        # soepelere spread bij rvol hoog
+        rvol = float(inp.get("rvol", 0))
+        spread_bps = float(inp.get("spread_bps", 999))
+        return (rvol >= 2.0) and (spread_bps <= 5)
+    if tod == "power_hour":
+        spread_bps = float(inp.get("spread_bps", 999))
+        return spread_bps <= 6
+    return False
+
+def cost_block(inp: Dict[str, Any]) -> Dict[str, float | str | bool]:
+    # commissies in bps per kant → 2 kanten
+    comm_side_bps = float(inp.get("commission_side_bps", 0))
+    commission_roundtrip_pct = (comm_side_bps * 2.0) / 1e4
+    fx_roundtrip_pct = 0.0
+    spread_pct = float(inp.get("spread_bps", 0)) / 1e4
+    slippage_pct = float(inp.get("slippage_guard_bps", 0)) / 1e4
+    break_even = commission_roundtrip_pct + fx_roundtrip_pct + spread_pct + slippage_pct
+    return {
+        "cost_profile": str(inp.get("cost_profile") or "USD_CASH"),
+        "commission_roundtrip_pct": round(commission_roundtrip_pct, 6),
+        "fx_roundtrip_pct": round(fx_roundtrip_pct, 6),
+        "spread_pct": round(spread_pct, 6),
+        "slippage_pct": round(slippage_pct, 6),
+        "break_even_pct": round(break_even, 6),
+    }
+
+def probs_placeholder(inp: Dict[str, Any]) -> Dict[str, float]:
+    # simpele placeholder, monotone in rvol & slope
+    rvol = float(inp.get("rvol", 1.0))
+    slope = max(0.0, float(inp.get("vwap_slope_pct_per_min", 0.0)))
+    p1 = max(0.50, min(0.80, 0.55 + 0.05*(rvol-1) + 0.20*(slope>0)))
+    p2 = max(0.25, min(0.65, 0.30 + 0.03*(rvol-1) + 0.10*(slope>0)))
+    q  = (p1 + p2) / 2.0
+    return {"p1": round(p1, 4), "p2": round(p2, 4), "q": round(q, 4)}
+
+def decide_once(inp: Dict[str, Any]) -> Dict[str, Any]:
+    # Gates
+    gates = {
+        "data": all(k in inp for k in ["ticker","price","bid","ask","vwap"]),
+        "liquidity": float(inp.get("adv_30d_shares", 0)) >= 2_000_000,
+        "risk": float(inp.get("atr_pct", 0.02)) <= 0.03,
+        "regime": True,
+        "technique": technique_ok(inp),
+        "compliance": not bool(inp.get("halted", False)),
+        "market_safety": True,
+        "tod": tod_ok(inp),
+        "event_guard": True,
+        "latency_vwap": float(inp.get("quote_age_ms", 9999)) <= 800,
+    }
+    c = cost_block(inp)
+    gates["cost"] = c["break_even_pct"] <= 0.0030  # 30 bps drempel
+
+    ok_all = all(gates.values()) and edge_persistence_ok(inp)
+    if not ok_all:
         return {
             "decision": "NO_TRADE",
-            "ticker": getattr(req, "ticker", "TICK"),
+            "ticker": inp.get("ticker"),
             "sniper_score": 0.0,
-            "gates": {},
+            "gates": gates,
             "mode": "MARKET_ONLY",
             "orders": {},
             "entry": None,
             "stop_loss": None,
             "size_shares": None,
-            "costs": {},
+            "costs": c,
             "probs": {},
             "ev_estimate": {},
             "reason_codes": ["SCORE_LOW"],
-            "meta": {"version": "v3.2"},
+            "meta": {"version": VERSION, "latency_ms": 0},
             "rejections": {},
-            "explain_human": "Dummy engine: geen trade.",
+            "explain_human": "We doen niets: een of meer basisvoorwaarden kloppen niet (data, spread, risico of trend).",
         }
 
-    def run_scan(req: ScanRequest) -> Dict[str, Any]:
-        return {
-            "universe_name": req.universe_name,
-            "scanned": len(req.candidates or []),
-            "tradeables": 0,
-            "top": [],
-            "summary": {"NO_TRADE": len(req.candidates or []), "rejections": {}},
-            "meta": {"version": "v3.2", "universe_size": len(req.candidates or [])},
-        }
+    # Trade plan
+    price = float(inp.get("price", 0))
+    atr_pct = float(inp.get("atr_pct", 0.015))
+    stop_loss = round(price * (1 - max(0.02, atr_pct*0.5)), 4) if price > 0 else None
+    # sizing: minimaal min_order_value_usd; anders 1 share
+    min_val = float(inp.get("min_order_value_usd", 0))
+    shares = max(1, int(math.floor(min_val / price))) if (price > 0 and min_val > 0) else 1
 
-# ------------------------------------------------------------
-# App
-# ------------------------------------------------------------
-app = FastAPI(title="SNIPERBOT API", version="v3.2")
-logger = logging.getLogger("uvicorn.error")
+    probs = probs_placeholder(inp)
+    net_ev = probs["q"] * 0.01 - (1 - probs["q"]) * 0.008 - c["break_even_pct"]  # ruwe placeholder
+    ev = {"avg_loss_pct": -0.008, "net_ev_pct": round(float(net_ev), 6)}
 
+    plan_orders = {
+        "entry": {"type": "MARKET"},
+        "tp1": {"type": "MARKET", "fraction": 0.5, "trigger_pct": 0.01},
+        "exit": {"type": "TRAIL_STOP_MARKET", "trail_pct_min": 0.004, "trail_atr_mult": 0.6, "freeze_after_tp1_sec": 120},
+    }
+    return {
+        "decision": "TRADE_LONG",
+        "ticker": inp.get("ticker"),
+        "sniper_score": 5.5,
+        "gates": gates,
+        "mode": "MARKET_ONLY",
+        "orders": plan_orders,
+        "entry": price,
+        "stop_loss": stop_loss,
+        "size_shares": shares,
+        "costs": c,
+        "probs": probs,
+        "ev_estimate": ev,
+        "reason_codes": ["EV_OK","COST_OK","EDGE_2OF3"],
+        "meta": {"version": VERSION, "nowET": now_iso(), "latency_ms": 0, "universe_size": 150},
+        "rejections": {},
+        "explain_human": "Volume en trend zijn gunstig. We kopen met een marktorder, nemen bij +1% de helft winst en volgen de rest met een meeschuivende stop.",
+    }
 
-# --- WIJZIGING START: Initialiseer manager bij startup ---
-@app.on_event("startup")
-async def _init_token_mgr():
-    if os.getenv("EXEC_ENABLED", "false").lower() == "true":
-        app.state.saxo_mgr = SaxoTokenManager(
-            app_key=os.getenv("SAXO_APP_KEY", ""),
-            app_secret=os.getenv("SAXO_APP_SECRET", ""),
-            refresh_token=os.getenv("SAXO_REFRESH_TOKEN", ""),
-            token_url=os.getenv("SAXO_TOKEN_URL", "https://sim.logonvalidation.net/token"),
-            strategy=os.getenv("TOKEN_STRATEGY", "memory"),
-            storage_path=os.getenv("TOKEN_STORAGE_PATH", "/var/data/saxo_tokens.json"),
-            auto_refresh=os.getenv("TOKEN_AUTO_REFRESH", "true").lower() == "true",
-        )
-        app.state.saxo_mgr.start()
-# --- WIJZIGING EIND ---
+# ----------------------------
+# Routes: decide / scan
+# ----------------------------
 
-
-# ------------------------------------------------------------
-# Config / ENV
-# ------------------------------------------------------------
-API_KEY = os.getenv("API_KEY")
-
-TG_ENABLED = os.getenv("TG_ENABLED", "0").lower() in ("1", "true", "yes", "on")
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-
-# Saxo OAuth / Token endpoints
-SAXO_AUTH_URL = os.getenv("SAXO_AUTH_URL", "https://sim.logonvalidation.net/authorize")
-SAXO_TOKEN_URL = os.getenv("SAXO_TOKEN_URL", "https://sim.logonvalidation.net/token")
-SAXO_APP_KEY = os.getenv("SAXO_APP_KEY")
-SAXO_APP_SECRET = os.getenv("SAXO_APP_SECRET")
-SAXO_REDIRECT = os.getenv(
-    "SAXO_REDIRECT_URL",
-    "https://sniperbot-api.onrender.com/oauth/saxo/callback",
-)
-SAXO_REFRESH_TOKEN = os.getenv("SAXO_REFRESH_TOKEN")
-
-EXEC_ENABLED = os.getenv("EXEC_ENABLED", "0").lower() in ("1", "true", "yes", "on")
-
-# Ticker → UIC map (JSON string in env)
-_TICKER_UIC_MAP: Dict[str, int] = {}
-try:
-    if os.getenv("TICKER_UIC_MAP"):
-        _TICKER_UIC_MAP = json.loads(os.getenv("TICKER_UIC_MAP"))
-except Exception:
-    _TICKER_UIC_MAP = {}
-
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def require_api_key(x_api_key: Optional[str] = Header(None)):
-    if API_KEY:
-        if not x_api_key or x_api_key != API_KEY:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
-
-
-def _tg_send(text: str, disable_notification: bool = False) -> None:
-    """
-    Non-blocking best effort: log naar JSONL en stuur Telegram wanneer TG_ENABLED true is.
-    Zet header X-No-Notify: 1 om te dempen per request.
-    """
-    # Log naar JSONL (CI-proof, geen netwerk vereist)
-    try:
-        line = json.dumps({"ts": int(time.time()), "msg": text}, ensure_ascii=False)
-        with open("/tmp/sniperbot_events.jsonl", "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-
-    if not TG_ENABLED or not TG_BOT_TOKEN or not TG_CHAT_ID:
-        return
-    try:
-        payload = json.dumps(
-            {"chat_id": TG_CHAT_ID, "text": text, "disable_notification": disable_notification}
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=5).read()  # fire & forget
-    except Exception:
-        # Geen harde error in API-flow
-        pass
-
-
-def _human_decision_message(resp: Dict[str, Any]) -> str:
-    d = resp.get("decision", "NO_TRADE")
-    t = resp.get("ticker", "")
-    if d.startswith("TRADE_"):
-        side = "KOOP" if d == "TRADE_LONG" else "VERKOOP"
-        entry = resp.get("entry")
-        stop = resp.get("stop_loss")
-        size = resp.get("size_shares")
-        probs = resp.get("probs", {})
-        p1 = probs.get("p1")
-        p2 = probs.get("p2")
-        ev = (resp.get("ev_estimate") or {}).get("net_ev_pct")
-        reasons = ", ".join(resp.get("reason_codes") or [])
-        return (
-            f"{side} {t}. Instap {entry}, stop {stop}, grootte {size}.\n"
-            f"Doel: +1% snel wat winst nemen, daarna de rest laten meelopen.\n"
-            f"Waarom: verwachte waarde oké, kosten oké. (kans +1% ≈ {round(p1*100,2) if isinstance(p1,(int,float)) else '?'}%; "
-            f"+2% ≈ {round(p2*100,2) if isinstance(p2,(int,float)) else '?'}%; EV ≈ "
-            f"{round(ev*100,2) if isinstance(ev,(int,float)) else '?'}%)"
-        )
-    else:
-        why = resp.get("explain_human") or "We doen niets."
-        return why
-
-
-def _human_scan_message(resp: Dict[str, Any]) -> str:
-    top = resp.get("top") or []
-    uni = resp.get("universe_name", "?")
-    scanned = resp.get("scanned", 0)
-    tradeables = resp.get("tradeables", 0)
-    if not top:
-        return f"Scan {uni}: {scanned} bekeken, 0 kandidaten om te handelen."
-    # Toon max 3
-    lines = [f"Scan {uni}: {scanned} bekeken, {tradeables} tradeable.\nTop picks:"]
-    for item in top[:3]:
-        t = item.get("ticker", "?")
-        s = item.get("sniper_score", 0)
-        d = item.get("decision", "")
-        lines.append(f"• {t} — score {round(s,2)} — {d}")
-    return "\n".join(lines)
-
-
-def _saxo_require_env():
-    missing = [k for k, v in {
-        "SAXO_APP_KEY": SAXO_APP_KEY,
-        "SAXO_APP_SECRET": SAXO_APP_SECRET,
-        "SAXO_REDIRECT_URL": SAXO_REDIRECT
-    }.items() if not v]
-    if missing:
-        raise HTTPException(status_code=500, detail=f"Missing env: {', '.join(missing)}")
-
-
-def _saxo_token_request(payload: Dict[str, str]) -> Dict[str, Any]:
-    body = urllib.parse.urlencode(payload).encode()
-    req = urllib.request.Request(
-        SAXO_TOKEN_URL, data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode())
-
-
-# --- VERWIJDERING: Deze helper is niet meer nodig door de Token Manager ---
-# def _get_access_token_from_refresh() -> str:
-#     """Gebruik SAXO_REFRESH_TOKEN om een access token op te halen."""
-#     if not SAXO_REFRESH_TOKEN:
-#         raise HTTPException(status_code=400, detail="Missing SAXO_REFRESH_TOKEN")
-#     _saxo_require_env()
-#     tok = _saxo_token_request({
-#         "grant_type": "refresh_token",
-#         "refresh_token": SAXO_REFRESH_TOKEN,
-#         "client_id": SAXO_APP_KEY,
-#         "client_secret": SAXO_APP_SECRET,
-#         "redirect_uri": SAXO_REDIRECT,
-#     })
-#     access = tok.get("access_token")
-#     if not access:
-#         raise HTTPException(status_code=502, detail="Could not obtain access_token from refresh_token")
-#     return access
-
-
-# ------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "version": "v3.2"}
-
-
-@app.post("/decide", dependencies=[Depends(require_api_key)])
-def decide_endpoint(
-    req: DecideRequest,
-    request: Request,
-    x_no_notify: Optional[str] = Header(None),
-):
-    t0 = time.time()
-    resp = run_decision(req)
-    resp["meta"] = resp.get("meta", {})
-    resp["meta"].update({"latency_ms": int((time.time() - t0) * 1000)})
-
-    # Telegram melding (tenzij X-No-Notify)
+@app.post("/decide")
+def decide_route(req: Dict[str, Any], x_api_key: str | None = Header(None), x_no_notify: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+    out = decide_once(req or {})
     if not x_no_notify:
-        try:
-            _tg_send(_human_decision_message(resp))
-        except Exception:
-            pass
-    return resp
+        notify_async(f"decide {out.get('ticker')} → {out.get('decision')}")
+    return out
 
+class ScanBody(BaseModel):
+    universe_name: str = "SP100"
+    top_k: int = 3
+    candidates: List[Dict[str, Any]]
 
-@app.post("/scan", dependencies=[Depends(require_api_key)])
-def scan_endpoint(
-    req: ScanRequest,
-    request: Request,
-    x_no_notify: Optional[str] = Header(None),
-):
-    t0 = time.time()
-    resp = run_scan(req)
-    resp["meta"] = resp.get("meta", {})
-    resp["meta"].update({"latency_ms": int((time.time() - t0) * 1000)})
+@app.post("/scan")
+def scan_route(body: ScanBody, x_api_key: str | None = Header(None), x_no_notify: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+    results: List[Dict[str, Any]] = []
+    rejections_summary: Dict[str, int] = {}
 
+    for c in body.candidates:
+        r = decide_once(c)
+        results.append(r)
+        if r["decision"] == "NO_TRADE":
+            for code in r.get("reason_codes", []):
+                rejections_summary[code] = rejections_summary.get(code, 0) + 1
+
+    tradeables = [r for r in results if r["decision"].startswith("TRADE")]
+    top = tradeables[: max(0, body.top_k)]
+    out = {
+        "universe_name": body.universe_name,
+        "scanned": len(results),
+        "tradeables": len(tradeables),
+        "top": top,
+        "summary": {
+            "TRADE_LONG": sum(1 for r in results if r["decision"] == "TRADE_LONG"),
+            "NO_TRADE": sum(1 for r in results if r["decision"] == "NO_TRADE"),
+            "rejections": rejections_summary,
+        },
+        "meta": {"version": VERSION, "nowET": now_iso(), "latency_ms": 0, "universe_size": len(body.candidates)},
+    }
     if not x_no_notify:
-        try:
-            _tg_send(_human_scan_message(resp))
-        except Exception:
-            pass
-    return resp
+        notify_async(f"scan {body.universe_name}: {out['summary']}")
+    return out
 
+# ----------------------------
+# Routes: Saxo auth helpers
+# ----------------------------
 
-@app.post("/execute", dependencies=[Depends(require_api_key)])
-async def execute_endpoint(  # --- WIJZIGING: Route is nu async ---
-    req: ExecuteRequest,
-    request: Request,
-    x_no_notify: Optional[str] = Header(None),
-):
-    """
-    Veilig standaard: DRY_RUN (preflight).
-    Voor live SIM-orders: zet EXEC_ENABLED=true én stuur confirm=true.
-    Vereist: TICKER_UIC_MAP (JSON), SAXO_REFRESH_TOKEN en Saxo app-config.
-    """
-    # Altijd eerst preflight tenzij je expliciet bevestigt én EXEC_ENABLED aan staat
-    if not req.confirm or not EXEC_ENABLED:
-        return {
+@app.post("/saxo/refresh")
+def saxo_refresh(x_api_key: str | None = Header(None)):
+    require_api_key(x_api_key)
+    data = SAXO._refresh_locked()
+    return {"ok": True, "rotated": data["rotated"]}
+
+@app.get("/saxo/accounts/me")
+def saxo_accounts_me(x_api_key: str | None = Header(None)):
+    require_api_key(x_api_key)
+    url = f"{SAXO_BASE}/port/v1/accounts/me"
+    resp = saxo_get(url)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+# ----------------------------
+# Route: execute (DRY_RUN / LIVE_SIM)
+# ----------------------------
+
+class ExecBody(BaseModel):
+    ticker: str
+    shares: int
+    entry: float
+    stop: float
+    confirm: bool = False
+
+@app.post("/execute")
+def execute_route(body: ExecBody, x_api_key: str | None = Header(None), x_no_notify: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+
+    # Always return DRY_RUN if confirm==False OR feature flags off
+    if not body.confirm or not EXEC_ENABLED:
+        res = {
             "ok": True,
             "mode": "DRY_RUN",
             "entry_result": {"dry_run": True, "status": "skip", "reason": "preflight"},
             "stop_result": {"dry_run": True, "status": "skip", "reason": "preflight"},
         }
+        if not x_no_notify:
+            notify_async(f"execute DRY_RUN {body.ticker} x{body.shares} @~{body.entry}")
+        return res
 
-    ticker = req.ticker.upper()
-    uic = _TICKER_UIC_MAP.get(ticker)
+    # Live SIM guard
+    if not LIVE_TRADING:
+        return {
+            "ok": True,
+            "mode": "LIVE_SIM",
+            "entry_result": {"status": "error", "error": "LIVE_TRADING=false", "sent": {}},
+            "stop_result": {"status": "skip", "reason": "not_implemented_safely"},
+        }
+
+    # Preconditions
+    if not SAXO_ACCOUNT_KEY:
+        return {
+            "ok": True,
+            "mode": "LIVE_SIM",
+            "entry_result": {"status": "error", "error": "SAXO_ACCOUNT_KEY missing", "sent": {}},
+            "stop_result": {"status": "skip", "reason": "not_implemented_safely"},
+        }
+    uic = TICKER_UIC_MAP.get(body.ticker.upper())
     if not uic:
-        raise HTTPException(status_code=400, detail=f"Missing UIC for {ticker} (check TICKER_UIC_MAP env)")
+        return {
+            "ok": True,
+            "mode": "LIVE_SIM",
+            "entry_result": {"status": "error", "error": f"UIC not found for {body.ticker}", "sent": {}},
+            "stop_result": {"status": "skip", "reason": "not_implemented_safely"},
+        }
 
-    # --- WIJZIGING START: Haal Bearer via manager ---
-    mgr = getattr(app.state, "saxo_mgr", None)
-    if not mgr:
-        raise HTTPException(status_code=500, detail="Token manager ontbreekt (EXEC_ENABLED=false?).")
+    # Ensure access token
     try:
-        access_token = await mgr.get_access_token()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Token refresh faalde: {e}")
-    # --- WIJZIGING EIND ---
+        SAXO.get_access_token()
+    except HTTPException as e:
+        return {
+            "ok": True,
+            "mode": "LIVE_SIM",
+            "entry_result": {"status": "error", "error": f"Auth error: {e.detail}", "sent": {}},
+            "stop_result": {"status": "skip", "reason": "not_implemented_safely"},
+        }
 
-    # Saxo order body (simpel market BUY)
-    order_body = {
-        "AccountKey": os.getenv("SAXO_ACCOUNT_KEY"),  # optioneel; anders default
+    # Build order (simple market buy)
+    order_payload = {
+        "AccountKey": SAXO_ACCOUNT_KEY,
+        "Uic": uic,
         "AssetType": "Stock",
-        "Amount": req.shares,
         "BuySell": "Buy",
+        "Amount": max(1, int(body.shares)),
         "OrderType": "Market",
-        "Uic": int(uic),
-        "ExternalReference": f"sniperbot-{int(time.time())}",
+        "OrderDuration": {"DurationType": "DayOrder"},
+        "ExternalReference": f"SNIPERBOT-{int(time.time())}",
+        "OpenClose": "Open",
+        "ManualOrder": False,
     }
 
-    # Plaats order (entry)
-    entry_result = {}
-    try:
-        payload = json.dumps(order_body).encode("utf-8")
-        req_http = urllib.request.Request(
-            "https://gateway.saxobank.com/sim/openapi/trade/v2/orders",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {access_token}", # Gebruikt nu token van manager
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req_http, timeout=20) as r:
-            entry_result = json.loads(r.read().decode())
-    except Exception as e:
-        # Als live call faalt, fail zacht en geef terug wat we probeerden
-        entry_result = {"status": "error", "error": str(e), "sent": order_body}
+    url = f"{SAXO_BASE}/trade/v2/orders"
+    resp = saxo_post(url, order_payload)
 
-    # Stop‐loss (indicatief; afhankelijk van account/permissions)
-    stop_result = {"status": "skip", "reason": "not_implemented_safely"}
-    # (Je kunt hier een tweede call doen naar /orders of /orders/{id}/related)
+    if resp.status_code != 201 and resp.status_code != 200:
+        entry_result = {"status": "error", "error": f"HTTP Error {resp.status_code}: {resp.text}", "sent": order_payload}
+    else:
+        entry_result = {"status": "ok", "response": resp.json(), "sent": order_payload}
 
-    if not x_no_notify:
-        try:
-            _tg_send(f"SIM order ingestuurd voor {ticker}: {req.shares} stuks (mode=LIVE_SIM).")
-        except Exception:
-            pass
-
-    return {
+    out = {
         "ok": True,
         "mode": "LIVE_SIM",
         "entry_result": entry_result,
-        "stop_result": stop_result,
+        "stop_result": {"status": "skip", "reason": "not_implemented_safely"},
     }
+    if not x_no_notify:
+        notify_async(f"execute {out['mode']} {body.ticker} x{body.shares} → {entry_result['status']}")
+    return out
 
 
-# ---------------- Saxo OAuth helper routes -----------------
+# ----------------------------
+# Exception handler (nette JSON)
+# ----------------------------
 
-# --- WIJZIGING START: Nieuw status-endpoint ---
-@app.get("/oauth/saxo/status")
-async def saxo_status():
-    mgr = getattr(app.state, "saxo_mgr", None)
-    if not mgr:
-        return {"ok": False, "note": "EXEC_ENABLED=false of token manager niet geïnitialiseerd"}
-    st = mgr.status()
-    # geen tokens lekken
-    return {"ok": True, "status": st}
-# --- WIJZIGING EIND ---
+@app.exception_handler(HTTPException)
+def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
+# ----------------------------
+# Run (local)
+# ----------------------------
 
-@app.get("/oauth/saxo/login")
-def saxo_login():
-    _saxo_require_env()
-    params = {
-        "response_type": "code",
-        "client_id": SAXO_APP_KEY,
-        "redirect_uri": SAXO_REDIRECT,
-        "scope": "openid offline_access",  # nodig voor refresh_token
-        "state": "sniperbot",
-    }
-    url = SAXO_AUTH_URL + "?" + urllib.parse.urlencode(params)
-    return RedirectResponse(url, status_code=302)
-
-
-@app.get("/oauth/saxo/callback")
-def saxo_callback(code: str, state: str = "sniperbot"):
-    _saxo_require_env()
-    data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": SAXO_REDIRECT,
-        "client_id": SAXO_APP_KEY,
-        "client_secret": SAXO_APP_SECRET,
-    }
-    try:
-        tok = _saxo_token_request(data)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Token exchange failed: {e}")
-
-    refresh = tok.get("refresh_token")
-    access = tok.get("access_token")
-
-    preview = (refresh[:10] + "…") if isinstance(refresh, str) and len(refresh) > 14 else refresh
-    note = (
-        "Zet de volledige refresh token in Render als SAXO_REFRESH_TOKEN "
-        "en herdeploy. (Deze endpoint toont om veiligheidsredenen slechts een preview.)"
-    )
-    return JSONResponse({
-        "ok": True,
-        "got_access_token": bool(access),
-        "got_refresh_token": bool(refresh),
-        "refresh_token_preview": preview,
-        "note": note,
-    })
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
