@@ -36,20 +36,34 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import requests
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, validator
 
-# Redis is optioneel
-try:
-    import redis  # type: ignore
-except Exception:  # pragma: no cover
-    redis = None
+# Import async token manager
+from .token_manager import SaxoTokenManager
 
 APP_VERSION = "v3.2"
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sniperbot")
 
 app = FastAPI(title="SNIPERBOT API", version=APP_VERSION)
+
+# ======= Startup/Shutdown Events =======
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize token manager background refresh"""
+    if saxo_token_manager:
+        saxo_token_manager.start()
+        log.info("SaxoTokenManager background refresh started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up token manager"""
+    if saxo_token_manager and saxo_token_manager._bg_task:
+        saxo_token_manager._bg_task.cancel()
+        log.info("SaxoTokenManager background task cancelled")
 
 # ======= Config uit ENV =======
 
@@ -74,39 +88,6 @@ except Exception as e:
     TICKER_UIC_MAP = {}
 
 REDIS_URL = os.getenv("REDIS_URL", "")
-
-# ======= Redis client (optioneel, aanbevolen voor refresh-rotatie) =======
-
-rds: Optional["redis.Redis"] = None
-if REDIS_URL and redis is not None:
-    try:
-        rds = redis.from_url(REDIS_URL, decode_responses=True, ssl=True)
-        # Smoke test
-        rds.ping()
-        log.info("Redis OK.")
-    except Exception as e:
-        log.warning("Redis init faalde: %s", e)
-        rds = None
-
-
-def kv_get(key: str) -> Optional[str]:
-    if rds:
-        try:
-            return rds.get(key)
-        except Exception:
-            return None
-    return None
-
-
-def kv_set(key: str, value: str, ttl: Optional[int] = None) -> None:
-    if rds:
-        try:
-            if ttl:
-                rds.setex(key, ttl, value)
-            else:
-                rds.set(key, value)
-        except Exception:
-            pass
 
 
 # ======= Security (API Key) =======
@@ -157,122 +138,109 @@ class ExecuteRequest(BaseModel):
         return v
 
 
-# ======= Saxo OAuth Token Manager =======
+# ======= Initialize Saxo Token Manager (async, disk-based) =======
 
-class SaxoAuthManager:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._access_token: Optional[str] = None
-        self._expires_at: float = 0.0  # epoch
+def _get_initial_refresh_token() -> str:
+    """Get refresh token from env - disk fallback is handled by SaxoTokenManager"""
+    env_rt = os.getenv("SAXO_REFRESH_TOKEN", "")
+    if not env_rt:
+        raise HTTPException(status_code=400, detail="SAXO_REFRESH_TOKEN ontbreekt.")
+    return env_rt.strip()
 
-    @property
-    def expires_at(self) -> float:
-        return self._expires_at
-
-    def _get_refresh_token(self) -> str:
-        rt = kv_get("saxo:refresh_token")
-        if rt:
-            return rt
-        env_rt = os.getenv("SAXO_REFRESH_TOKEN", "")
-        if not env_rt:
-            raise HTTPException(status_code=400, detail="SAXO_REFRESH_TOKEN ontbreekt (ook niet in Redis).")
-        return env_rt.strip()
-
-    def _store_refresh_token(self, rt: str) -> None:
-        kv_set("saxo:refresh_token", rt)
-
-    def _store_access_token(self, at: str, expires_in: int) -> None:
-        now = time.time()
-        self._access_token = at
-        # 30s veiligheidsmarge
-        self._expires_at = now + max(0, int(expires_in) - 30)
-        kv_set("saxo:access_token", at, ttl=int(expires_in))
-
-    def _refresh_now(self) -> None:
-        if not SAXO_APP_KEY or not SAXO_APP_SECRET:
-            raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
-
-        rt = self._get_refresh_token()
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": rt,
-            "client_id": SAXO_APP_KEY,
-            "client_secret": SAXO_APP_SECRET,
-        }
-        headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
-        resp = requests.post(SAXO_TOKEN_URL, data=data, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Token refresh failed ({resp.status_code}): {resp.text}")
-
-        js = resp.json()
-        at = js.get("access_token")
-        exp = js.get("expires_in", 900)
-        if not at:
-            raise HTTPException(status_code=502, detail="Token refresh ok maar geen access_token in respons.")
-
-        self._store_access_token(at, int(exp))
-
-        # Rotatie
-        new_rt = js.get("refresh_token")
-        if new_rt and new_rt != rt:
-            self._store_refresh_token(new_rt)
-
-    def get_access_token(self, force: bool = False) -> str:
-        with self._lock:
-            now = time.time()
-            if force or (self._access_token is None) or (now >= self._expires_at - 60):
-                self._refresh_now()
-            return self._access_token  # type: ignore
-
-    def auth_header(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {self.get_access_token()}"}
-
-
-saxo_auth = SaxoAuthManager()
-
-
-# ======= Saxo helpers =======
-
-def saxo_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    url = f"{SAXO_BASE}{path}"
+# Initialize async token manager with disk storage
+saxo_token_manager: Optional[SaxoTokenManager] = None
+if SAXO_APP_KEY and SAXO_APP_SECRET:
     try:
-        h = saxo_auth.auth_header()
-        r = requests.get(url, headers=h, params=params, timeout=20)
-        if r.status_code == 401:
-            # één stille refresh + retry
-            h = saxo_auth.auth_header()
-            r = requests.get(url, headers=h, params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
-    except requests.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Saxo GET {path} failed ({r.status_code}): {r.text}") from e  # type: ignore
+        initial_refresh_token = _get_initial_refresh_token()
+        saxo_token_manager = SaxoTokenManager(
+            app_key=SAXO_APP_KEY,
+            app_secret=SAXO_APP_SECRET,
+            refresh_token=initial_refresh_token,
+            token_url=SAXO_TOKEN_URL,
+            strategy="disk",
+            storage_path="/var/data/saxo_tokens.json",
+            auto_refresh=True,
+            safety_margin_sec=90
+        )
+        log.info("SaxoTokenManager initialized with disk storage")
+    except Exception as e:
+        log.warning("SaxoTokenManager init failed: %s", e)
+        saxo_token_manager = None
+else:
+    log.warning("SAXO_APP_KEY/SECRET missing - SaxoTokenManager not initialized")
 
 
-def saxo_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+# ======= Saxo helpers (async) =======
+
+async def get_auth_header() -> Dict[str, str]:
+    """Get authorization header with fresh access token"""
+    if not saxo_token_manager:
+        raise HTTPException(status_code=400, detail="SaxoTokenManager not initialized")
+    
+    access_token = await saxo_token_manager.get_access_token()
+    return {"Authorization": f"Bearer {access_token}"}
+
+async def saxo_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     url = f"{SAXO_BASE}{path}"
+    log.debug("Saxo GET %s with params: %s", path, params)
+    
     try:
-        h = {**saxo_auth.auth_header(), "Content-Type": "application/json", "Accept": "application/json"}
-        r = requests.post(url, headers=h, json=payload, timeout=20)
-        if r.status_code == 401:
-            h = {**saxo_auth.auth_header(), "Content-Type": "application/json", "Accept": "application/json"}
-            r = requests.post(url, headers=h, json=payload, timeout=20)
-        r.raise_for_status()
-        if r.text.strip():
+        h = await get_auth_header()
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(url, headers=h, params=params)
+            
+            if r.status_code == 401:
+                # Force refresh and retry once
+                log.debug("401 on Saxo GET %s, forcing token refresh", path)
+                if saxo_token_manager:
+                    await saxo_token_manager.refresh_access_token()
+                h = await get_auth_header()
+                r = await client.get(url, headers=h, params=params)
+            
+            r.raise_for_status()
             return r.json()
-        return {"ok": True}
-    except requests.HTTPError as e:
-        msg = r.text if "r" in locals() else str(e)
-        code = r.status_code if "r" in locals() else 502
-        raise HTTPException(status_code=502, detail=f"Saxo POST {path} failed ({code}): {msg}") from e
+    except httpx.HTTPError as e:
+        status_code = getattr(e.response, 'status_code', 502) if hasattr(e, 'response') else 502
+        response_text = getattr(e.response, 'text', str(e)) if hasattr(e, 'response') else str(e)
+        log.error("Saxo GET %s failed (%s): %s", path, status_code, response_text)
+        raise HTTPException(status_code=502, detail=f"Saxo GET {path} failed ({status_code}): {response_text}") from e
+
+
+async def saxo_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{SAXO_BASE}{path}"
+    log.debug("Saxo POST %s with payload keys: %s", path, list(payload.keys()))
+    
+    try:
+        h = {**await get_auth_header(), "Content-Type": "application/json", "Accept": "application/json"}
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(url, headers=h, json=payload)
+            
+            if r.status_code == 401:
+                # Force refresh and retry once
+                log.debug("401 on Saxo POST %s, forcing token refresh", path)
+                if saxo_token_manager:
+                    await saxo_token_manager.refresh_access_token()
+                h = {**await get_auth_header(), "Content-Type": "application/json", "Accept": "application/json"}
+                r = await client.post(url, headers=h, json=payload)
+            
+            r.raise_for_status()
+            if r.text.strip():
+                return r.json()
+            return {"ok": True}
+    except httpx.HTTPError as e:
+        status_code = getattr(e.response, 'status_code', 502) if hasattr(e, 'response') else 502
+        response_text = getattr(e.response, 'text', str(e)) if hasattr(e, 'response') else str(e)
+        log.error("Saxo POST %s failed (%s): %s", path, status_code, response_text)
+        raise HTTPException(status_code=502, detail=f"Saxo POST {path} failed ({status_code}): {response_text}") from e
 
 
 # ======= Utils =======
 
-def get_account_key() -> str:
+async def get_account_key() -> str:
     if SAXO_ACCOUNT_KEY_ENV:
         return SAXO_ACCOUNT_KEY_ENV
     # fallback: haal actief account op
-    js = saxo_get("/port/v1/accounts/me")
+    js = await saxo_get("/port/v1/accounts/me")
     # Verwacht payload met "Data":[{...}]
     try:
         data = js.get("Data", [])
@@ -302,27 +270,57 @@ def healthz():
 
 
 @app.get("/oauth/saxo/status", summary="Saxo Status")
-def saxo_status(x_api_key: Optional[str] = Header(None)):
+async def saxo_status(x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
+    
+    if not saxo_token_manager:
+        return {
+            "ok": False,
+            "error": "SaxoTokenManager not initialized",
+            "exec_enabled": EXEC_ENABLED,
+            "live_trading": LIVE_TRADING,
+        }
+    
+    status = saxo_token_manager.status()
     return {
         "ok": True,
-        "has_access_token": bool(kv_get("saxo:access_token")),
-        "expires_at_epoch": getattr(saxo_auth, "_expires_at", 0.0),
+        "has_access_token": status.get("has_access_token", False),
+        "expires_in_s": status.get("expires_in_s"),
+        "last_refresh_ts": status.get("last_refresh_ts"),
+        "storage_strategy": status.get("strategy"),
+        "storage_path": status.get("storage_path"),
         "exec_enabled": EXEC_ENABLED,
         "live_trading": LIVE_TRADING,
     }
 
 
 @app.post("/saxo/refresh", summary="Forceer Saxo token refresh")
-def saxo_refresh(x_api_key: Optional[str] = Header(None)):
+async def saxo_refresh(x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
-    # Force refresh; duidelijke fouten i.p.v. 500
-    if not SAXO_APP_KEY or not SAXO_APP_SECRET:
-        raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
-    if not (os.getenv("SAXO_REFRESH_TOKEN") or kv_get("saxo:refresh_token")):
-        raise HTTPException(status_code=400, detail="Ontbrekende refresh token (SAXO_REFRESH_TOKEN/Redis).")
-    at = saxo_auth.get_access_token(force=True)
-    return {"ok": True, "access_token_preview": (at[:20] + "..."), "expires_at_epoch": saxo_auth.expires_at}
+    
+    if not saxo_token_manager:
+        raise HTTPException(status_code=400, detail="SaxoTokenManager not initialized")
+    
+    # Force refresh with debug logging
+    try:
+        log.info("Manual token refresh requested")
+        old_bundle = saxo_token_manager._bundle
+        log.debug("Before refresh - expires_in_s: %s", old_bundle.seconds_left)
+        
+        new_bundle = await saxo_token_manager.refresh_access_token()
+        
+        log.info("Token refresh completed successfully")
+        log.debug("After refresh - expires_in_s: %s", new_bundle.seconds_left)
+        
+        return {
+            "ok": True, 
+            "access_token_preview": (new_bundle.access_token[:20] + "..." if new_bundle.access_token else "None"),
+            "expires_in_s": new_bundle.seconds_left,
+            "last_refresh_ts": new_bundle.last_refresh_ts
+        }
+    except Exception as e:
+        log.error("Token refresh failed: %s", str(e))
+        raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
 
 
 @app.post("/decide", summary="Decide Endpoint")
@@ -427,7 +425,7 @@ def scan_endpoint(req: ScanRequest, x_api_key: Optional[str] = Header(None), x_n
 
 @app.post("/execute", summary="Execute Endpoint",
           description="Veilig standaard: DRY_RUN (preflight). Voor live SIM-orders: EXEC_ENABLED=true én confirm=true. Vereist: TICKER_UIC_MAP, Saxo OAuth config.")
-def execute_endpoint(req: ExecuteRequest, x_api_key: Optional[str] = Header(None), x_no_notify: Optional[str] = Header(None)):
+async def execute_endpoint(req: ExecuteRequest, x_api_key: Optional[str] = Header(None), x_no_notify: Optional[str] = Header(None)):
     require_api_key(x_api_key)
 
     tkr = req.ticker.upper()
@@ -470,15 +468,18 @@ def execute_endpoint(req: ExecuteRequest, x_api_key: Optional[str] = Header(None
         }
 
     # Vereiste tokens aanwezig?
-    if not SAXO_APP_KEY or not SAXO_APP_SECRET:
-        raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
-    if not (os.getenv("SAXO_REFRESH_TOKEN") or kv_get("saxo:refresh_token")):
-        raise HTTPException(status_code=400, detail="SAXO_REFRESH_TOKEN ontbreekt (ook niet in Redis).")
+    if not saxo_token_manager:
+        raise HTTPException(status_code=400, detail="SaxoTokenManager not initialized")
 
     # Haal/refresh access token en account key
-    at_preview = saxo_auth.get_access_token()[:20] + "..."
     try:
-        account_key = get_account_key()
+        access_token = await saxo_token_manager.get_access_token()
+        at_preview = access_token[:20] + "..."
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
+    
+    try:
+        account_key = await get_account_key()
     except HTTPException as e:
         return {
             "ok": True,
@@ -499,7 +500,7 @@ def execute_endpoint(req: ExecuteRequest, x_api_key: Optional[str] = Header(None
     }
 
     try:
-        entry_resp = saxo_post("/trade/v2/orders", entry_payload)
+        entry_resp = await saxo_post("/trade/v2/orders", entry_payload)
         entry_ok = True
     except HTTPException as e:
         entry_resp = {"status": "error", "error": str(e.detail), "sent": entry_payload}
@@ -518,7 +519,7 @@ def execute_endpoint(req: ExecuteRequest, x_api_key: Optional[str] = Header(None
             "OrderDuration": {"DurationType": "GoodTillCancel"},
         }
         try:
-            stop_resp = saxo_post("/trade/v2/orders", stop_payload)
+            stop_resp = await saxo_post("/trade/v2/orders", stop_payload)
         except HTTPException as e:
             stop_resp = {"status": "error", "error": str(e.detail), "sent": stop_payload}
     else:
