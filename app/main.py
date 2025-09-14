@@ -230,6 +230,88 @@ class SaxoAuthManager:
 
 saxo_auth = SaxoAuthManager()
 
+# Initialize potential SaxoTokenManager as global tm (if configured)
+tm: Optional["SaxoTokenManager"] = None
+try:
+    from .token_manager import SaxoTokenManager
+    if SAXO_APP_KEY and SAXO_APP_SECRET:
+        # Try to get refresh token for TokenManager
+        rt = kv_get("saxo:refresh_token") or os.getenv("SAXO_REFRESH_TOKEN", "")
+        if rt:
+            tm = SaxoTokenManager(
+                app_key=SAXO_APP_KEY,
+                app_secret=SAXO_APP_SECRET, 
+                refresh_token=rt,
+                token_url=SAXO_TOKEN_URL,
+                strategy="memory",
+                auto_refresh=False  # Don't start background task automatically
+            )
+except Exception as e:
+    log.warning("Could not initialize SaxoTokenManager: %s", e)
+    tm = None
+
+
+# ======= Diagnostic helpers =======
+
+def _mgr_candidates() -> List[Dict[str, Any]]:
+    """Find all potential Saxo token manager candidates."""
+    candidates = []
+    
+    # 1. Global saxo_auth (SaxoAuthManager)
+    if saxo_auth:
+        candidates.append({
+            "type": "SaxoAuthManager",
+            "name": "saxo_auth",
+            "instance": saxo_auth,
+            "id": id(saxo_auth),
+            "has_token": bool(getattr(saxo_auth, "_access_token", None)),
+            "expires_at": getattr(saxo_auth, "_expires_at", 0.0)
+        })
+    
+    # 2. Global tm (SaxoTokenManager)
+    if tm:
+        candidates.append({
+            "type": "SaxoTokenManager", 
+            "name": "tm",
+            "instance": tm,
+            "id": id(tm),
+            "has_token": bool(tm._bundle.access_token if hasattr(tm, "_bundle") else False),
+            "expires_at": tm._bundle.expires_at if hasattr(tm, "_bundle") and tm._bundle.expires_at else 0.0
+        })
+    
+    # 3. app.state.saxo_mgr (if it exists)
+    if hasattr(app, "state") and hasattr(app.state, "saxo_mgr"):
+        mgr = app.state.saxo_mgr
+        candidates.append({
+            "type": type(mgr).__name__,
+            "name": "app.state.saxo_mgr", 
+            "instance": mgr,
+            "id": id(mgr),
+            "has_token": bool(getattr(mgr, "_access_token", None) or 
+                            (hasattr(mgr, "_bundle") and getattr(mgr._bundle, "access_token", None))),
+            "expires_at": getattr(mgr, "_expires_at", 0.0) or 
+                         (getattr(mgr._bundle, "expires_at", 0.0) if hasattr(mgr, "_bundle") else 0.0)
+        })
+    
+    return candidates
+
+
+def _callable_get_mgr_fallback() -> Optional[Any]:
+    """Try to get manager from accessor function if it exists."""
+    try:
+        # Check if there's a _get_mgr function somewhere (common pattern)
+        if hasattr(app, "_get_mgr") and callable(getattr(app, "_get_mgr")):
+            return app._get_mgr()
+        
+        # Check for other common accessor patterns
+        for attr_name in ["get_saxo_manager", "get_token_manager", "_get_saxo_mgr"]:
+            if hasattr(app, attr_name) and callable(getattr(app, attr_name)):
+                return getattr(app, attr_name)()
+                
+        return None
+    except Exception:
+        return None
+
 
 # ======= Saxo helpers =======
 
@@ -531,3 +613,109 @@ def execute_endpoint(req: ExecuteRequest, x_api_key: Optional[str] = Header(None
         "stop_result": stop_resp,
         "note": f"access_token={at_preview}",
     }
+
+
+@app.get("/diag/saxo/assert", summary="Saxo TokenManager Health Assertion",
+         description="Verify manager convergence and identity. Compares object identities between app.state.saxo_mgr, global tm, and accessor functions. Never crashes or hangs, always returns JSON.")
+def saxo_assert_endpoint(x_api_key: Optional[str] = Header(None)):
+    """
+    Health assertion endpoint for Saxo TokenManager convergence.
+    Compares object identities and status of all found managers.
+    Returns JSON with IDs and status of all managers plus convergence boolean.
+    """
+    try:
+        require_api_key(x_api_key)
+        
+        # Collect all manager candidates
+        candidates = _mgr_candidates()
+        
+        # Try accessor fallback
+        accessor_mgr = _callable_get_mgr_fallback()
+        if accessor_mgr:
+            candidates.append({
+                "type": type(accessor_mgr).__name__,
+                "name": "accessor(_get_mgr)",
+                "instance": accessor_mgr,
+                "id": id(accessor_mgr),
+                "has_token": bool(getattr(accessor_mgr, "_access_token", None) or 
+                                (hasattr(accessor_mgr, "_bundle") and getattr(accessor_mgr._bundle, "access_token", None))),
+                "expires_at": getattr(accessor_mgr, "_expires_at", 0.0) or 
+                             (getattr(accessor_mgr._bundle, "expires_at", 0.0) if hasattr(accessor_mgr, "_bundle") else 0.0)
+            })
+        
+        # Build response with safe serialization (no instance references)
+        managers = []
+        unique_ids = set()
+        
+        for candidate in candidates:
+            try:
+                mgr_info = {
+                    "name": candidate["name"],
+                    "type": candidate["type"], 
+                    "id": candidate["id"],
+                    "has_token": candidate["has_token"],
+                    "expires_at": candidate["expires_at"],
+                    "time_to_expiry_s": max(0, int(candidate["expires_at"] - time.time())) if candidate["expires_at"] > 0 else None
+                }
+                managers.append(mgr_info)
+                unique_ids.add(candidate["id"])
+            except Exception as e:
+                # Safe fallback for any individual manager
+                managers.append({
+                    "name": candidate.get("name", "unknown"),
+                    "type": candidate.get("type", "unknown"),
+                    "id": candidate.get("id", 0),
+                    "has_token": False,
+                    "expires_at": 0.0,
+                    "time_to_expiry_s": None,
+                    "error": str(e)
+                })
+        
+        # Determine convergence: all managers should ideally point to same instance
+        converged = len(unique_ids) <= 1 and len(managers) > 0
+        
+        # Additional convergence checks
+        active_managers = [m for m in managers if m.get("has_token", False)]
+        token_convergence = len(set(m["id"] for m in active_managers)) <= 1 if active_managers else True
+        
+        return {
+            "ok": True,
+            "converged": converged and token_convergence,
+            "total_managers": len(managers),
+            "unique_instances": len(unique_ids),
+            "active_token_managers": len(active_managers),
+            "managers": managers,
+            "convergence_details": {
+                "instance_convergence": converged,
+                "token_convergence": token_convergence,
+                "has_app_state_mgr": any(m["name"] == "app.state.saxo_mgr" for m in managers),
+                "has_global_tm": any(m["name"] == "tm" for m in managers),
+                "has_saxo_auth": any(m["name"] == "saxo_auth" for m in managers),
+                "has_accessor": any("accessor" in m["name"] for m in managers)
+            },
+            "timestamp": time.time(),
+            "version": APP_VERSION
+        }
+        
+    except Exception as e:
+        # Never crash - always return valid JSON even on errors
+        return {
+            "ok": False,
+            "converged": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "total_managers": 0,
+            "unique_instances": 0,
+            "active_token_managers": 0,
+            "managers": [],
+            "convergence_details": {
+                "instance_convergence": False,
+                "token_convergence": False,
+                "has_app_state_mgr": False,
+                "has_global_tm": False,
+                "has_saxo_auth": False,
+                "has_accessor": False
+            },
+            "timestamp": time.time(),
+            "version": APP_VERSION
+        }
