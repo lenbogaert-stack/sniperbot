@@ -1,5 +1,5 @@
 import os, json, httpx
-from typing import Optional
+from typing import Optional, Callable
 
 class SaxoClient:
     """
@@ -7,13 +7,15 @@ class SaxoClient:
     - Default: DRY RUN (SAXO_ENABLED=false) -> alleen loggen, niets sturen.
     - LIVE HTTP: zet SAXO_ENABLED=true, vul env (token, account, base_url).
     - UIC Mapping: via env TICKER_UIC_MAP='{"AAPL":265598,"MSFT":1904}' (voorbeeld).
+    - Runtime Bearer: get_bearer callable for dynamic token retrieval.
     """
 
-    def __init__(self):
+    def __init__(self, get_bearer: Optional[Callable[[], str]] = None):
         self.enabled = os.getenv("SAXO_ENABLED", "false").lower() == "true"
         self.base_url = os.getenv("SAXO_BASE_URL", "").rstrip("/")
         self.access_token = os.getenv("SAXO_ACCESS_TOKEN", "")
         self.account_key = os.getenv("SAXO_ACCOUNT_KEY", "")
+        self.get_bearer = get_bearer  # Runtime bearer token provider
         # eenvoudige symbol→UIC mapping om zonder extra API-calls te werken
         try:
             self.ticker_uic_map = json.loads(os.getenv("TICKER_UIC_MAP", "{}"))
@@ -25,8 +27,23 @@ class SaxoClient:
 
     # ---------- helpers ----------
     def _headers(self):
+        # Runtime bearer via TokenManager or fallback to env
+        bearer_token = None
+        if self.get_bearer:
+            try:
+                bearer_token = self.get_bearer()
+            except Exception:
+                bearer_token = None
+        
+        # Fallback to env token
+        if not bearer_token:
+            bearer_token = self.access_token
+        
+        if not bearer_token:
+            raise RuntimeError("No bearer token available (neither from get_bearer nor env)")
+            
         return {
-            "Authorization": f"Bearer {self.access_token}",
+            "Authorization": f"Bearer {bearer_token}",
             "Content-Type": "application/json",
         }
 

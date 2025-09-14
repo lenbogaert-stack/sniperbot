@@ -45,11 +45,45 @@ try:
 except Exception:  # pragma: no cover
     redis = None
 
+# TokenManager import
+from app.token_manager import SaxoTokenManager
+
 APP_VERSION = "v3.2"
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sniperbot")
 
 app = FastAPI(title="SNIPERBOT API", version=APP_VERSION)
+
+# Global TokenManager variable
+tm: Optional[SaxoTokenManager] = None
+
+@app.on_event("startup")
+async def startup_event():
+    global tm
+    # Initialize TokenManager if Saxo credentials are available
+    app_key = os.getenv("SAXO_APP_KEY", "")
+    app_secret = os.getenv("SAXO_APP_SECRET", "")
+    refresh_token = os.getenv("SAXO_REFRESH_TOKEN", "")
+    
+    if app_key and app_secret and refresh_token:
+        try:
+            tm = SaxoTokenManager(
+                app_key=app_key,
+                app_secret=app_secret,
+                refresh_token=refresh_token,
+                token_url=os.getenv("SAXO_TOKEN_URL", "https://sim.logonvalidation.net/token"),
+                strategy="disk",  # Use disk persistence for Render
+                storage_path="/var/data/saxo_tokens.json",
+                auto_refresh=True,
+                safety_margin_sec=90
+            )
+            tm.start()
+            log.info("TokenManager initialized and started")
+        except Exception as e:
+            log.warning("TokenManager initialization failed: %s", e)
+            tm = None
+    else:
+        log.info("TokenManager not initialized - missing Saxo credentials")
 
 # ======= Config uit ENV =======
 
@@ -311,6 +345,42 @@ def saxo_status(x_api_key: Optional[str] = Header(None)):
         "exec_enabled": EXEC_ENABLED,
         "live_trading": LIVE_TRADING,
     }
+
+
+@app.get("/saxo/token/status", summary="Saxo TokenManager Status")
+def saxo_token_status(x_api_key: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+    if tm is None:
+        return {
+            "ok": True,
+            "token_manager": "not_initialized",
+            "reason": "missing_credentials_or_init_failed"
+        }
+    
+    status = tm.status()
+    return {
+        "ok": True,
+        "token_manager": "initialized",
+        **status
+    }
+
+
+@app.post("/saxo/token/refresh", summary="Force Saxo TokenManager refresh")
+async def saxo_token_refresh(x_api_key: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+    if tm is None:
+        raise HTTPException(status_code=400, detail="TokenManager not initialized")
+    
+    try:
+        bundle = await tm.refresh_access_token()
+        return {
+            "ok": True,
+            "refreshed": True,
+            "expires_in_s": bundle.seconds_left,
+            "last_refresh_ts": bundle.last_refresh_ts
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
 
 
 @app.post("/saxo/refresh", summary="Forceer Saxo token refresh")

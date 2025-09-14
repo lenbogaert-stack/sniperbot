@@ -6,6 +6,10 @@ services:
     autoDeploy: true
     healthCheckPath: /healthz
     dockerfilePath: ./Dockerfile
+    disk:
+      name: sniperbot-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: EXEC_MODE
         value: MARKET_ONLY
@@ -19,3 +23,13 @@ services:
         sync: false
       - key: TG_CHAT_ID
         sync: false
+      - key: SAXO_APP_KEY
+        sync: false
+      - key: SAXO_APP_SECRET
+        sync: false
+      - key: SAXO_REFRESH_TOKEN
+        sync: false
+      - key: SAXO_TOKEN_URL
+        value: "https://sim.logonvalidation.net/token"
+      - key: SAXO_BASE
+        value: "https://gateway.saxobank.com/sim/openapi"
