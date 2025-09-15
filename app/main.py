@@ -227,8 +227,17 @@ class SaxoAuthManager:
     def auth_header(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self.get_access_token()}"}
 
+    def status(self):
+        return {"ok": True, "expires_at": self._expires_at, "access_token": bool(self._access_token)}
+
 
 saxo_auth = SaxoAuthManager()
+
+# Make SaxoAuthManager a single source of truth
+app.state.saxo_mgr = saxo_auth          # app-state verwijst naar dezelfde instance
+globals()["tm"] = saxo_auth             # (optioneel) ook de globale 'tm' gelijkzetten
+if hasattr(saxo_auth, "start"):
+    saxo_auth.start()                   # start background refresh loop indien aanwezig
 
 
 # ======= Saxo helpers =======
@@ -323,6 +332,43 @@ def saxo_refresh(x_api_key: Optional[str] = Header(None)):
         raise HTTPException(status_code=400, detail="Ontbrekende refresh token (SAXO_REFRESH_TOKEN/Redis).")
     at = saxo_auth.get_access_token(force=True)
     return {"ok": True, "access_token_preview": (at[:20] + "..."), "expires_at_epoch": saxo_auth.expires_at}
+
+
+def _safe_id(x): return id(x) if x is not None else None
+
+@app.get("/oauth/saxo/assert", tags=["diagnostics"])
+def oauth_saxo_assert():
+    mgr_state  = getattr(app.state, "saxo_mgr", None) if hasattr(app, "state") else None
+    mgr_global = globals().get("tm", None)
+    # Kiest dezelfde manager als je status/refresh gebruikt: state -> global
+    mgr = mgr_state or mgr_global
+
+    ids = {
+        "app_state.saxo_mgr": _safe_id(mgr_state),
+        "global.tm":          _safe_id(mgr_global),
+        "chosen":             _safe_id(mgr),
+    }
+
+    converged = (
+        ids["chosen"] is not None and
+        (ids["chosen"] == ids["app_state.saxo_mgr"] or ids["app_state.saxo_mgr"] is None) and
+        (ids["chosen"] == ids["global.tm"]         or ids["global.tm"]         is None)
+    )
+
+    safe_status = None
+    try:
+        safe_status = mgr.status() if (mgr and hasattr(mgr, "status")) else None
+    except Exception as e:
+        safe_status = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    return {
+        "ok": True,
+        "ts": time.time(),
+        "ids": ids,
+        "converged": converged,
+        "manager_status": safe_status,
+        "note": "Converged=True betekent dat status en refresh dezelfde TokenManager-instance delen."
+    }
 
 
 @app.post("/decide", summary="Decide Endpoint")
