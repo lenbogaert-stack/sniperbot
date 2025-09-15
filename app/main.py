@@ -398,6 +398,16 @@ async def saxo_refresh(x_api_key: Optional[str] = Header(None)):
         res = await mgr.refresh_access_token()
         st  = mgr.status() if hasattr(mgr, "status") else {}
         return {"ok": True, "result": res, "status": st, **({"env": env_info} if missing else {})}
+
+    except HTTPException as e:
+        return {
+            "ok": False,
+            "error": "HTTPException",
+            "http_status": getattr(e, "status_code", None),
+            "detail": getattr(e, "detail", None),
+            "env": env_info,
+        }
+        ...
     except Exception as e:
         log_saxo.exception("Saxo refresh failed")
         return {"ok": False, "error": type(e).__name__, "detail": str(e), "env": env_info}
