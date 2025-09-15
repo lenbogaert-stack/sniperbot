@@ -369,7 +369,7 @@ def oauth_saxo_probe(x_api_key: Optional[str] = Header(None)):
         except Exception:
             js = None
         return {
-            "ok": resp.status_code == 200,
+            "ok": resp.status_code == (200, 201),
             "http_status": resp.status_code,
             "json_keys": sorted(list(js.keys())) if isinstance(js, dict) else None,
             "preview": preview,
