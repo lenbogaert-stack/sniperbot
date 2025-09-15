@@ -227,9 +227,21 @@ class SaxoAuthManager:
     def auth_header(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self.get_access_token()}"}
 
+    # Dummy status
+    def status(self):
+        return {"ok": True, "expires_at": self._expires_at, "access_token": bool(self._access_token)}
+
+    # Async refresh (for new diagnostics route)
+    async def refresh_access_token(self):
+        # Just call the sync refresh in this example
+        self._refresh_now()
+        return {"ok": True, "expires_at": self._expires_at, "access_token": bool(self._access_token)}
 
 saxo_auth = SaxoAuthManager()
 
+# Singleton refs (bron van waarheid)
+app.state.saxo_mgr = saxo_auth
+globals()["tm"] = saxo_auth
 
 # ======= Saxo helpers =======
 
@@ -293,13 +305,104 @@ def uic_for_ticker(ticker: str) -> int:
         raise HTTPException(status_code=400, detail=f"Ticker '{t}' niet gevonden in TICKER_UIC_MAP.")
     return int(TICKER_UIC_MAP[t])
 
+# ===================== SAXO DIAGNOSTICS & REFRESH (SAFE) ====================
+import os as _os, time as _time, logging as _logging
+from fastapi import HTTPException as _HTTPException
+
+log = _logging.getLogger("saxo")
+
+def _resolve_mgr():
+    """Eén plaats om de TokenManager te vinden."""
+    mgr = getattr(app.state, "saxo_mgr", None) if hasattr(app, "state") else None
+    return mgr or globals().get("tm", None)
+
+@app.on_event("startup")
+async def _sync_mgr_refs():
+    """
+    Zorg dat alle referenties naar dezelfde instance wijzen:
+    - als tm al bestaat: zet app.state.saxo_mgr = tm
+    - als alleen app.state.saxo_mgr bestaat: zet tm = diezelfde instance
+    """
+    try:
+        gtm = globals().get("tm", None)
+        stm = getattr(app.state, "saxo_mgr", None) if hasattr(app, "state") else None
+        if gtm and (stm is None):
+            app.state.saxo_mgr = gtm
+        elif (gtm is None) and stm:
+            globals()["tm"] = stm
+    except Exception:
+        pass  # nooit startup blokkeren
+
+# ---- Fail-safe refresh: vervang je bestaande /saxo/refresh hiermee ----------
+@app.post("/saxo/refresh")
+async def saxo_refresh():
+    mgr = _resolve_mgr()
+    if not mgr:
+        return {"ok": False, "reason": "TokenManager not available"}
+
+    # Preflight: check env variabelen (lek geen secrets, toon enkel welke ontbreken)
+    missing = [k for k in ("SAXO_APP_KEY", "SAXO_APP_SECRET", "SAXO_REFRESH_TOKEN") if not _os.getenv(k)]
+    env_info = {
+        "missing_env": missing,
+        "exec_enabled": _os.getenv("EXEC_ENABLED"),
+        "token_strategy": _os.getenv("TOKEN_STRATEGY"),
+        "token_storage_path": _os.getenv("TOKEN_STORAGE_PATH"),
+    }
+
+    try:
+        res = await mgr.refresh_access_token()
+        st  = mgr.status() if hasattr(mgr, "status") else {}
+        return {"ok": True, "result": res, "status": st, **({"env": env_info} if missing else {})}
+    except Exception as e:
+        log.exception("Saxo refresh failed")
+        return {
+            "ok": False,
+            "error": type(e).__name__,
+            "detail": str(e),
+            "env": env_info
+        }
+
+# ---- Assert: verifieer dat status/refresh dezelfde manager zien --------------
+def _safe_id(x): return id(x) if x is not None else None
+
+@app.get("/oauth/saxo/assert")
+def oauth_saxo_assert():
+    mgr_state  = getattr(app.state, "saxo_mgr", None) if hasattr(app, "state") else None
+    mgr_global = globals().get("tm", None)
+    mgr = mgr_state or mgr_global
+
+    ids = {
+        "app_state.saxo_mgr": _safe_id(mgr_state),
+        "global.tm":          _safe_id(mgr_global),
+        "chosen":             _safe_id(mgr),
+    }
+    converged = (
+        ids["chosen"] is not None and
+        (ids["chosen"] == ids["app_state.saxo_mgr"] or ids["app_state.saxo_mgr"] is None) and
+        (ids["chosen"] == ids["global.tm"]         or ids["global.tm"]         is None)
+    )
+
+    safe_status = None
+    try:
+        safe_status = mgr.status() if (mgr and hasattr(mgr, "status")) else None
+    except Exception as e:
+        safe_status = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    return {
+        "ok": True,
+        "ts": _time.time(),
+        "ids": ids,
+        "converged": converged,
+        "manager_status": safe_status,
+        "note": "Converged=True ⇒ status en refresh delen dezelfde TokenManager-instance."
+    }
+# =============================================================================
 
 # ======= Endpoints =======
 
 @app.get("/healthz", summary="Healthz")
 def healthz():
     return {"ok": True, "version": APP_VERSION}
-
 
 @app.get("/oauth/saxo/status", summary="Saxo Status")
 def saxo_status(x_api_key: Optional[str] = Header(None)):
@@ -311,19 +414,6 @@ def saxo_status(x_api_key: Optional[str] = Header(None)):
         "exec_enabled": EXEC_ENABLED,
         "live_trading": LIVE_TRADING,
     }
-
-
-@app.post("/saxo/refresh", summary="Forceer Saxo token refresh")
-def saxo_refresh(x_api_key: Optional[str] = Header(None)):
-    require_api_key(x_api_key)
-    # Force refresh; duidelijke fouten i.p.v. 500
-    if not SAXO_APP_KEY or not SAXO_APP_SECRET:
-        raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
-    if not (os.getenv("SAXO_REFRESH_TOKEN") or kv_get("saxo:refresh_token")):
-        raise HTTPException(status_code=400, detail="Ontbrekende refresh token (SAXO_REFRESH_TOKEN/Redis).")
-    at = saxo_auth.get_access_token(force=True)
-    return {"ok": True, "access_token_preview": (at[:20] + "..."), "expires_at_epoch": saxo_auth.expires_at}
-
 
 @app.post("/decide", summary="Decide Endpoint")
 def decide_endpoint(req: DecideRequest, x_api_key: Optional[str] = Header(None), x_no_notify: Optional[str] = Header(None)):
@@ -347,7 +437,6 @@ def decide_endpoint(req: DecideRequest, x_api_key: Optional[str] = Header(None),
         "rejections": {},
         "explain_human": "Dummy engine: geen trade.",
     }
-
 
 @app.post("/scan", summary="Scan Endpoint")
 def scan_endpoint(req: ScanRequest, x_api_key: Optional[str] = Header(None), x_no_notify: Optional[str] = Header(None)):
@@ -423,7 +512,6 @@ def scan_endpoint(req: ScanRequest, x_api_key: Optional[str] = Header(None), x_n
         "summary": summary,
         "meta": {"version": APP_VERSION, "universe_size": len(req.candidates), "latency_ms": 0},
     }
-
 
 @app.post("/execute", summary="Execute Endpoint",
           description="Veilig standaard: DRY_RUN (preflight). Voor live SIM-orders: EXEC_ENABLED=true én confirm=true. Vereist: TICKER_UIC_MAP, Saxo OAuth config.")
