@@ -343,40 +343,65 @@ def oauth_saxo_assert(x_api_key: Optional[str] = Header(None)):
     return {"ok": True, "converged": converged, "ids": ids, "manager_status": safe_status}
 
 
+import base64
+from typing import Optional
+from fastapi import Header
+
 @app.post("/oauth/saxo/probe")
-def oauth_saxo_probe(x_api_key: Optional[str] = Header(None)):
+def oauth_saxo_probe(x_api_key: Optional[str] = Header(None),
+                     x_debug_refresh_token: Optional[str] = Header(None)):
     """
-    Rechtstreekse call naar het token endpoint met ENV-waarden (Basic).
-    Slaat niets op; puur diagnose. Leakt geen secrets.
+    Diagnose: test refresh direct tegen SAXO_TOKEN_URL mbv ENV. Toont geen secrets.
+    Accepteert 200/201. Probeert Basic en valt terug op client_secret_post.
+    Je kan optioneel een refresh_token overschrijven met header X-Debug-Refresh-Token.
     """
     require_api_key(x_api_key)
-    token_url = SAXO_TOKEN_URL
-    app_key   = SAXO_APP_KEY
-    app_sec   = SAXO_APP_SECRET
-    rtok      = os.getenv("SAXO_REFRESH_TOKEN", "").strip()
-    missing = [k for k, v in {"SAXO_APP_KEY": app_key, "SAXO_APP_SECRET": app_sec, "SAXO_REFRESH_TOKEN": rtok}.items() if not v]
+
+    token_url = os.getenv("SAXO_TOKEN_URL", "https://sim.logonvalidation.net/token").strip()
+    app_key   = os.getenv("SAXO_APP_KEY", "").strip()
+    app_sec   = os.getenv("SAXO_APP_SECRET", "").strip()
+    rtok_env  = os.getenv("SAXO_REFRESH_TOKEN", "").strip()
+    rtok      = (x_debug_refresh_token or rtok_env).strip()
+
+    missing = [k for k,v in {
+        "SAXO_APP_KEY": app_key, "SAXO_APP_SECRET": app_sec, "SAXO_REFRESH_TOKEN": rtok
+    }.items() if not v]
     if missing:
-        return {"ok": False, "reason": "missing_env", "missing_env": missing}
+        return {"ok": False, "reason": "missing_env", "missing_env": missing,
+                "using": {"token_url": token_url, "app_key_tail": app_key[-4:], "rt_tail": rtok[-8:]}}
 
+    def safe_using():
+        return {"token_url": token_url, "app_key_tail": app_key[-4:], "rt_tail": rtok[-8:]}
+
+    # Try BASIC first
     basic = base64.b64encode(f"{app_key}:{app_sec}".encode("ascii")).decode("ascii")
-    headers = {"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
+    headers = {"Authorization": f"Basic {basic}",
+               "Content-Type": "application/x-www-form-urlencoded",
+               "Accept": "application/json"}
     data = {"grant_type": "refresh_token", "refresh_token": rtok}
-    try:
-        resp = requests.post(token_url, data=data, headers=headers, timeout=15)
-        preview = resp.text[:600] if isinstance(resp.text, str) else str(resp.text)
-        try:
-            js = resp.json()
-        except Exception:
-            js = None
-        return {
-            "ok": resp.status_code == (200, 201),
-            "http_status": resp.status_code,
-            "json_keys": sorted(list(js.keys())) if isinstance(js, dict) else None,
-            "preview": preview,
-        }
-    except Exception as e:
-        return {"ok": False, "error": type(e).__name__, "detail": str(e)}
 
+    try:
+        resp = requests.post(token_url, headers=headers, data=data, timeout=15)
+        ok = resp.status_code in (200, 201)
+        preview = resp.text[:600] if isinstance(resp.text, str) else str(resp.text)
+        try: j = resp.json()
+        except Exception: j = None
+        if ok:
+            return {"ok": True, "http_status": resp.status_code,
+                    "json_keys": sorted(j.keys()) if isinstance(j, dict) else None,
+                    "using": safe_using(), "method": "basic"}
+        # Fallback: client_secret_post
+        resp2 = requests.post(token_url, data={**data, "client_id": app_key, "client_secret": app_sec}, timeout=15)
+        ok2 = resp2.status_code in (200, 201)
+        preview2 = resp2.text[:600] if isinstance(resp2.text, str) else str(resp2.text)
+        try: j2 = resp2.json()
+        except Exception: j2 = None
+        return {"ok": ok2, "http_status": resp2.status_code,
+                "json_keys": sorted(j2.keys()) if isinstance(j2, dict) else None,
+                "preview": (preview2 if not ok2 else None),
+                "using": safe_using(), "method": "client_secret_post"}
+    except Exception as e:
+        return {"ok": False, "error": type(e).__name__, "detail": str(e), "using": safe_using()}
 
 @app.post("/saxo/refresh")
 async def saxo_refresh(x_api_key: Optional[str] = Header(None)):
