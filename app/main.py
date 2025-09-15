@@ -204,7 +204,7 @@ class SaxoAuthManager:
         }
         data = {"grant_type": "refresh_token", "refresh_token": rt}
         resp = requests.post(SAXO_TOKEN_URL, data=data, headers=headers, timeout=15)
-        if resp.status_code != 200:
+        if resp.status_code != (200, 201):
             raise HTTPException(status_code=502, detail=f"Token refresh failed ({resp.status_code}): {resp.text}")
 
         js = resp.json()
