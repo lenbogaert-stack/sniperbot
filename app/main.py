@@ -151,45 +151,45 @@ class SaxoAuthManager:
         # 60s veiligheidsmarge
         self._expires_at = now + max(0, int(expires_in) - 60)
 
-def _refresh_now(self) -> None:
-    if not SAXO_APP_KEY or not SAXO_APP_SECRET:
-        raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
+    def _refresh_now(self) -> None:
+        if not SAXO_APP_KEY or not SAXO_APP_SECRET:
+            raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
 
-    rt = self._get_refresh_token()
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": rt,
-        "client_id": SAXO_APP_KEY,
-        "client_secret": SAXO_APP_SECRET,
-    }
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-    }
+        rt = self._get_refresh_token()
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": SAXO_APP_KEY,
+            "client_secret": SAXO_APP_SECRET,
+        }
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
 
-    resp = requests.post(SAXO_TOKEN_URL, data=data, headers=headers, timeout=15)
+        resp = requests.post(SAXO_TOKEN_URL, data=data, headers=headers, timeout=15)
 
-    # ✅ accepteer 200 én 201
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=502, detail=f"Token refresh failed ({resp.status_code}): {resp.text}")
+        # ✅ accepteer 200 én 201
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"Token refresh failed ({resp.status_code}): {resp.text}")
 
-    try:
-        js = resp.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail=f"Token refresh decode failed: {resp.text[:400]}")
+        try:
+            js = resp.json()
+        except Exception:
+            raise HTTPException(status_code=502, detail=f"Token refresh decode failed: {resp.text[:400]}")
 
-    at = js.get("access_token")
-    exp = int(js.get("expires_in", 900))
-    if not at:
-        raise HTTPException(status_code=502, detail="Token refresh ok maar geen access_token in respons.")
+        at = js.get("access_token")
+        exp = int(js.get("expires_in", 900))
+        if not at:
+            raise HTTPException(status_code=502, detail="Token refresh ok maar geen access_token in respons.")
 
-    # access token + expiry opslaan
-    self._store_access_token(at, exp)
+        # access token + expiry opslaan
+        self._store_access_token(at, exp)
 
-    # refresh-token rotatie opslaan (in-process)
-    new_rt = js.get("refresh_token")
-    if new_rt and new_rt != rt:
-        self._store_refresh_token(new_rt)
+        # refresh-token rotatie opslaan (in-process)
+        new_rt = js.get("refresh_token")
+        if new_rt and new_rt != rt:
+            self._store_refresh_token(new_rt)
 
     def get_access_token(self, force: bool = False) -> str:
         with self._lock:
