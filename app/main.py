@@ -12,7 +12,6 @@
 # - SAXO_REFRESH_TOKEN=<initiële refresh token>   # kan geroteerd worden
 # - SAXO_ACCOUNT_KEY=<AccountKey>                 # optioneel; anders auto-ophalen
 # - TICKER_UIC_MAP={"AAPL":265598,"MSFT":1900}    # JSON string, UIC's voor tickers
-# - REDIS_URL=rediss://:<pwd>@<host>:<port>/0     # optioneel voor token-rotatie/persist
 #
 # Endpoints:
 # - GET  /healthz
@@ -35,12 +34,6 @@ from typing import Any, Dict, List, Optional
 import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, validator
-
-# Optional Redis
-try:
-    import redis  # type: ignore
-except Exception:  # pragma: no cover
-    redis = None
 
 APP_VERSION = "v3.2"
 logging.basicConfig(level=logging.INFO)
@@ -71,39 +64,7 @@ except Exception as e:
     log.warning("Kon TICKER_UIC_MAP niet parsen: %s", e)
     TICKER_UIC_MAP = {}
 
-REDIS_URL = os.getenv("REDIS_URL", "").strip()
-
-# ==================== Redis client (optioneel) ====================
-
-rds: Optional["redis.Redis"] = None
-if REDIS_URL and redis is not None:
-    try:
-        rds = redis.from_url(REDIS_URL, decode_responses=True)
-        rds.ping()
-        log.info("Redis OK.")
-    except Exception as e:
-        log.warning("Redis init faalde: %s", e)
-        rds = None
-
-
-def kv_get(key: str) -> Optional[str]:
-    if rds:
-        try:
-            return rds.get(key)
-        except Exception:
-            return None
-    return None
-
-
-def kv_set(key: str, value: str, ttl: Optional[int] = None) -> None:
-    if rds:
-        try:
-            if ttl and ttl > 0:
-                rds.setex(key, ttl, value)
-            else:
-                rds.set(key, value)
-        except Exception:
-            pass
+_stored_refresh_token: Optional[str] = None
 
 
 # ==================== Security (API key) ====================
@@ -158,9 +119,9 @@ class ExecuteRequest(BaseModel):
 class SaxoAuthManager:
     """
     Simpele, thread-safe token manager met refresh_token flow (Basic Auth).
-    - Houdt access_token in memory (en optioneel in Redis met TTL)
+    - Houdt access_token in memory
     - Skew marge van 60s vóór expiry
-    - Schrijft nieuwe refresh_token naar Redis (als aanwezig)
+    - Bewaart een nieuw refresh_token in-process voor rotatie
     """
     def __init__(self):
         self._lock = threading.Lock()
@@ -172,24 +133,23 @@ class SaxoAuthManager:
         return self._expires_at
 
     def _get_refresh_token(self) -> str:
-        rt = kv_get("saxo:refresh_token")
-        if rt:
-            return rt
+        global _stored_refresh_token
+        if _stored_refresh_token:
+            return _stored_refresh_token
         env_rt = os.getenv("SAXO_REFRESH_TOKEN", "").strip()
         if not env_rt:
-            raise HTTPException(status_code=400, detail="SAXO_REFRESH_TOKEN ontbreekt (ook niet in Redis).")
+            raise HTTPException(status_code=400, detail="SAXO_REFRESH_TOKEN ontbreekt.")
         return env_rt
 
     def _store_refresh_token(self, rt: str) -> None:
-        kv_set("saxo:refresh_token", rt)
+        global _stored_refresh_token
+        _stored_refresh_token = rt.strip()
 
     def _store_access_token(self, at: str, expires_in: int) -> None:
         now = time.time()
         self._access_token = at
         # 60s veiligheidsmarge
         self._expires_at = now + max(0, int(expires_in) - 60)
-        # TTL in Redis (optioneel)
-        kv_set("saxo:access_token", at, ttl=int(expires_in))
 
 def _refresh_now(self) -> None:
     if not SAXO_APP_KEY or not SAXO_APP_SECRET:
@@ -226,7 +186,7 @@ def _refresh_now(self) -> None:
     # access token + expiry opslaan
     self._store_access_token(at, exp)
 
-    # refresh-token rotatie opslaan (Redis of disk, afhankelijk van jouw kv_set)
+    # refresh-token rotatie opslaan (in-process)
     new_rt = js.get("refresh_token")
     if new_rt and new_rt != rt:
         self._store_refresh_token(new_rt)
@@ -459,11 +419,10 @@ def healthz():
 @app.get("/oauth/saxo/status", summary="Saxo Status")
 def saxo_status(x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
-    in_redis  = bool(kv_get("saxo:access_token"))
     in_memory = bool(getattr(saxo_auth, "_access_token", None))
     return {
         "ok": True,
-        "has_access_token": in_redis or in_memory,
+        "has_access_token": in_memory,
         "expires_at_epoch": getattr(saxo_auth, "_expires_at", 0.0),
         "exec_enabled": EXEC_ENABLED,
         "live_trading": LIVE_TRADING,
@@ -607,8 +566,8 @@ def execute_endpoint(req: ExecuteRequest, x_api_key: Optional[str] = Header(None
 
     if not SAXO_APP_KEY or not SAXO_APP_SECRET:
         raise HTTPException(status_code=400, detail="SAXO_APP_KEY/SECRET ontbreken.")
-    if not (os.getenv("SAXO_REFRESH_TOKEN") or kv_get("saxo:refresh_token")):
-        raise HTTPException(status_code=400, detail="SAXO_REFRESH_TOKEN ontbreekt (ook niet in Redis).")
+    if not (os.getenv("SAXO_REFRESH_TOKEN") or _stored_refresh_token):
+        raise HTTPException(status_code=400, detail="SAXO_REFRESH_TOKEN ontbreekt.")
 
     # Token + account key
     try:
