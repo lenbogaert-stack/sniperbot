@@ -81,6 +81,38 @@ def test_telegram_login_command(monkeypatch):
     assert state in captured[0][1]
 
 
+def test_telegram_login_command_alias(monkeypatch):
+    monkeypatch.setenv("TG_ENABLED", "true")
+    monkeypatch.setenv("TG_BOT_TOKEN", "dummy")
+    monkeypatch.setenv("TG_CHAT_ID", "123")
+    monkeypatch.setenv("TG_WEBHOOK_SECRET", "")
+    monkeypatch.setenv("SAXO_APP_KEY", "abc")
+    monkeypatch.setenv("SAXO_REDIRECT_URL", "https://example.com/oauth")
+    monkeypatch.setenv("SAXO_AUTH_URL", "https://sim.logonvalidation.net/authorize")
+    tg_manager.reload()
+    tg_manager._states.clear()
+
+    captured = []
+
+    def fake_send(chat_id: int, text: str) -> None:
+        captured.append((chat_id, text))
+
+    monkeypatch.setattr(tg_manager, "send_message", fake_send)
+
+    update = _build_update(123, text="/login_saxo")
+    with TestClient(app) as client:
+        res = client.post("/telegram/webhook", json=update)
+
+    data = res.json()
+    assert res.status_code == 200
+    assert data["action"] == "login_link_sent"
+    state = data["state"]
+    assert state in tg_manager._states
+    assert captured and captured[0][0] == 123
+    assert "https://sim.logonvalidation.net/authorize" in captured[0][1]
+    assert state in captured[0][1]
+
+
 def test_telegram_callback_success(monkeypatch):
     monkeypatch.setenv("TG_ENABLED", "true")
     monkeypatch.setenv("TG_BOT_TOKEN", "dummy")
