@@ -32,8 +32,12 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import requests
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, validator
+
+from app.telegram_login import LoginError
+from app.telegram_login import manager as telegram_login_manager
 
 APP_VERSION = "v3.2"
 logging.basicConfig(level=logging.INFO)
@@ -285,6 +289,187 @@ def _resolve_mgr():
     """Eén plaats om de TokenManager te vinden."""
     mgr = getattr(app.state, "saxo_mgr", None) if hasattr(app, "state") else None
     return mgr or globals().get("tm", None)
+
+
+def _tg_login_enabled() -> bool:
+    return telegram_login_manager.is_enabled()
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(None),
+):
+    if not _tg_login_enabled():
+        return {"ok": False, "reason": "telegram_disabled"}
+
+    secret = telegram_login_manager.webhook_secret
+    if secret:
+        provided = (x_telegram_bot_api_secret_token or "").strip()
+        if secret != provided:
+            raise HTTPException(status_code=401, detail="Invalid Telegram secret token")
+
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Telegram payload")
+
+    message = (
+        update.get("message")
+        or update.get("edited_message")
+        or update.get("channel_post")
+        or ((update.get("callback_query") or {}).get("message") if update.get("callback_query") else None)
+    )
+    if not message:
+        return {"ok": True, "skipped": "no_message"}
+
+    chat = message.get("chat") or {}
+    chat_id_raw = chat.get("id")
+    if chat_id_raw is None:
+        return {"ok": True, "skipped": "no_chat"}
+
+    try:
+        chat_id = int(chat_id_raw)
+    except (TypeError, ValueError):
+        return {"ok": True, "skipped": "invalid_chat"}
+
+    if not telegram_login_manager.is_chat_allowed(chat_id):
+        log.warning("Telegram chat %s niet geautoriseerd voor Saxo login", chat_id)
+        return {"ok": False, "error": "chat_not_allowed"}
+
+    text = (message.get("text") or "").strip()
+    if not text:
+        return {"ok": True, "skipped": "no_text"}
+
+    if not text.startswith("/"):
+        return {"ok": True, "skipped": "non_command"}
+
+    command_raw = text.split()[0]
+    command = command_raw.split("@", 1)[0]
+    user = message.get("from") or {}
+
+    if command == "/saxo_login":
+        try:
+            pending = telegram_login_manager.create_login_request(
+                chat_id,
+                first_name=user.get("first_name") or "",
+                username=user.get("username"),
+            )
+            authorize_url = telegram_login_manager.build_authorize_url(pending)
+            ttl_sec = max(60, int(pending.expires_at - pending.created_at))
+            ttl_min = max(1, int((ttl_sec + 59) // 60))
+            msg = (
+                "🔐 Saxo login gestart.\n"
+                f"Open deze link binnen ongeveer {ttl_min} min:\n{authorize_url}\n\n"
+                "Na het afronden ontvang je het refresh token hier in Telegram."
+            )
+            telegram_login_manager.send_message(chat_id, msg)
+            log.info("Telegram loginlink verzonden naar chat %s", chat_id)
+            return {"ok": True, "action": "login_link_sent", "state": pending.state}
+        except LoginError as exc:
+            telegram_login_manager.send_message(
+                chat_id, f"❌ Kan Saxo login niet starten: {exc}"
+            )
+            log.warning("Telegram login-start mislukt: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    if command in ("/start", "/help"):
+        telegram_login_manager.send_message(
+            chat_id,
+            "Beschikbare commando's:\n/saxo_login – vraag een nieuwe Saxo refresh token aan.",
+        )
+        return {"ok": True, "action": "help_sent"}
+
+    telegram_login_manager.send_message(
+        chat_id, "Onbekend commando. Gebruik /saxo_login voor Saxo OAuth."
+    )
+    return {"ok": True, "action": "unknown_command"}
+
+
+@app.get("/oauth/saxo/telegram/callback", response_class=HTMLResponse)
+def telegram_oauth_callback(
+    state: str,
+    code: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+):
+    info = telegram_login_manager.consume_state(state)
+    if not info:
+        return HTMLResponse(
+            "<html><body><h1>State ongeldig of verlopen</h1>"
+            "<p>Vraag een nieuwe login aan via Telegram (/saxo_login).</p></body></html>",
+            status_code=400,
+        )
+
+    chat_id = info.chat_id
+
+    if error:
+        detail = error_description or error
+        telegram_login_manager.send_message(
+            chat_id, f"❌ Saxo login mislukt: {detail}"
+        )
+        return HTMLResponse(
+            f"<html><body><h1>Login mislukt</h1><p>{detail}</p></body></html>",
+            status_code=400,
+        )
+
+    if not code:
+        telegram_login_manager.send_message(
+            chat_id, "❌ Saxo login: geen authorisatiecode ontvangen."
+        )
+        return HTMLResponse(
+            "<html><body><h1>Geen code ontvangen</h1>"
+            "<p>Probeer opnieuw via Telegram.</p></body></html>",
+            status_code=400,
+        )
+
+    try:
+        token_data = telegram_login_manager.exchange_code_for_tokens(code)
+    except LoginError as exc:
+        telegram_login_manager.send_message(
+            chat_id, f"❌ Saxo tokens ophalen mislukt: {exc}"
+        )
+        return HTMLResponse(
+            f"<html><body><h1>Token fout</h1><p>{exc}</p></body></html>",
+            status_code=400,
+        )
+
+    refresh_token = str(token_data.get("refresh_token") or "")
+    expires_in = token_data.get("expires_in")
+
+    if refresh_token:
+        try:
+            saxo_auth._store_refresh_token(refresh_token)
+            os.environ["SAXO_REFRESH_TOKEN"] = refresh_token
+        except Exception as exc:  # pragma: no cover - defensief
+            log.warning("Kon refresh token niet opslaan: %s", exc)
+
+    message_lines = ["✅ Saxo login geslaagd."]
+    if refresh_token:
+        message_lines.append("Nieuwe refresh token (bewaar veilig):")
+        message_lines.append(refresh_token)
+    else:
+        message_lines.append("Geen refresh token ontvangen. Controleer Saxo-configuratie.")
+
+    if expires_in:
+        try:
+            expires_sec = int(float(expires_in))
+            message_lines.append(f"Access token verloopt in ~{expires_sec} sec.")
+        except Exception:
+            message_lines.append(f"Expires in: {expires_in}")
+
+    telegram_login_manager.send_message(chat_id, "\n".join(message_lines))
+
+    tail = refresh_token[-6:] if refresh_token else "geen"
+    html_body = ["<html><body><h1>Saxo login geslaagd</h1>"]
+    html_body.append("<p>Bekijk Telegram voor het volledige refresh token.</p>")
+    if refresh_token:
+        html_body.append(
+            f"<p>Laatste 6 tekens van het token: <strong>{tail}</strong>.</p>"
+        )
+    html_body.append("</body></html>")
+
+    return HTMLResponse("".join(html_body))
 
 
 @app.get("/oauth/saxo/assert")
