@@ -348,7 +348,7 @@ async def telegram_webhook(
     command = command_raw.split("@", 1)[0]
     user = message.get("from") or {}
 
-    if command == "/saxo_login":
+    if command in {"/saxo_login", "/login_saxo"}:
         try:
             pending = telegram_login_manager.create_login_request(
                 chat_id,
@@ -376,12 +376,14 @@ async def telegram_webhook(
     if command in ("/start", "/help"):
         telegram_login_manager.send_message(
             chat_id,
-            "Beschikbare commando's:\n/saxo_login – vraag een nieuwe Saxo refresh token aan.",
+            "Beschikbare commando's:\n"
+            "/saxo_login – vraag een nieuwe Saxo refresh token aan. (/login_saxo werkt ook)",
         )
         return {"ok": True, "action": "help_sent"}
 
     telegram_login_manager.send_message(
-        chat_id, "Onbekend commando. Gebruik /saxo_login voor Saxo OAuth."
+        chat_id,
+        "Onbekend commando. Gebruik /saxo_login (of /login_saxo) voor Saxo OAuth.",
     )
     return {"ok": True, "action": "unknown_command"}
 
@@ -397,7 +399,7 @@ def telegram_oauth_callback(
     if not info:
         return HTMLResponse(
             "<html><body><h1>State ongeldig of verlopen</h1>"
-            "<p>Vraag een nieuwe login aan via Telegram (/saxo_login).</p></body></html>",
+            "<p>Vraag een nieuwe login aan via Telegram (/saxo_login of /login_saxo).</p></body></html>",
             status_code=400,
         )
 
