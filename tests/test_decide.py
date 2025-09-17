@@ -1,3 +1,7 @@
+import os
+
+os.environ["SINGLE_API_KEY"] = ""
+
 from app.main import app
 from fastapi.testclient import TestClient
 

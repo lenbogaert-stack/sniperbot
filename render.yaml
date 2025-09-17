@@ -19,3 +19,15 @@ services:
         sync: false
       - key: TG_CHAT_ID
         sync: false
+      - key: TG_WEBHOOK_SECRET
+        sync: false
+      - key: TG_ALLOWED_CHAT_IDS
+        sync: false
+      - key: SAXO_REDIRECT_URL
+        sync: false
+      - key: SAXO_AUTH_URL
+        value: https://sim.logonvalidation.net/authorize
+      - key: SAXO_AUTH_SCOPE
+        value: "offline_access trading"
+      - key: SAXO_LOGIN_STATE_TTL
+        value: "600"
